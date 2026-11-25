@@ -68,8 +68,8 @@ if st.session_state.usuario is None:
         st.markdown("<br>", unsafe_allow_html=True)
         c_logo1, c_title, c_logo2 = st.columns([1, 2.2, 1])
         with c_logo1:
-            if os.path.exists("assets/logo_el_cafetal.png"):
-                st.image("assets/logo_el_cafetal.png", use_container_width=True)
+            if os.path.exists("assets/logo_el_cafetal.jpg"):
+                st.image("assets/logo_el_cafetal.jpg", use_container_width=True)
         with c_title:
             st.markdown(
                 "<h3 style='text-align:center; color:#1B4332; margin-bottom:0;'>EPSDC Guerreros de la Montaña</h3>"
@@ -77,8 +77,8 @@ if st.session_state.usuario is None:
                 unsafe_allow_html=True
             )
         with c_logo2:
-            if os.path.exists("assets/logo_por_tu_cafe.png"):
-                st.image("assets/logo_por_tu_cafe.png", use_container_width=True)
+            if os.path.exists("assets/logo_por_tu_cafe.jpg"):
+                st.image("assets/logo_por_tu_cafe.jpg", use_container_width=True)
 
         st.markdown("---")
         st.subheader("Acceso al Sistema Administrativo y Control de Gestión")
