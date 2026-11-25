@@ -1,5 +1,6 @@
 import os
 import io
+from pathlib import Path
 from datetime import datetime, timedelta
 import streamlit as st
 import pandas as pd
@@ -13,6 +14,21 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# Rutas absolutas para logos en assets/
+BASE_DIR = Path(__file__).resolve().parent
+LOGO_CAFETAL_PATH = BASE_DIR / "assets" / "logo_el_cafetal.png"
+LOGO_PORTU_PATH = BASE_DIR / "assets" / "logo_por_tu_cafe.png"
+
+
+def render_logo(logo_path: Path, caption_fallback: str = ""):
+    if logo_path.exists():
+        st.image(str(logo_path), use_container_width=True)
+    elif os.path.exists(f"assets/{logo_path.name}"):
+        st.image(f"assets/{logo_path.name}", use_container_width=True)
+    elif caption_fallback:
+        st.caption(caption_fallback)
+
 
 # Inicializar Base de Datos
 init_db()
@@ -90,7 +106,23 @@ def guardar_tasa_bcv_administrador(nueva_tasa: float, usuario_admin: str):
     conn.close()
 
 
+def asegurar_columnas_inventario():
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(inventario)")
+    cols = {row["name"] for row in cur.fetchall()}
+    if "ubicacion_bodega" not in cols:
+        cur.execute("ALTER TABLE inventario ADD COLUMN ubicacion_bodega TEXT DEFAULT 'Almacén Principal Nirgua'")
+    if "precio_detal_usd" not in cols:
+        cur.execute("ALTER TABLE inventario ADD COLUMN precio_detal_usd REAL NOT NULL DEFAULT 0")
+    if "precio_mayor_usd" not in cols:
+        cur.execute("ALTER TABLE inventario ADD COLUMN precio_mayor_usd REAL NOT NULL DEFAULT 0")
+    conn.commit()
+    conn.close()
+
+
 asegurar_tabla_tasa_bcv()
+asegurar_columnas_inventario()
 
 # Estilos Corporativos CSS
 st.markdown("""
@@ -127,6 +159,7 @@ if "usuario" not in st.session_state:
 
 for key in [
     "ultimo_pdf_almacen", "ultimo_cod_almacen",
+    "ultimo_pdf_entrada_alm", "ultimo_cod_entrada_alm",
     "ultimo_pdf_compra", "ultimo_cod_compra",
     "ultimo_pdf_tesoreria", "ultimo_cod_tesoreria",
     "ultimo_pdf_venta", "ultimo_cod_venta"
@@ -143,8 +176,7 @@ if st.session_state.usuario is None:
         st.markdown("<br>", unsafe_allow_html=True)
         c_logo1, c_title, c_logo2 = st.columns([1, 2.2, 1])
         with c_logo1:
-            if os.path.exists("assets/logo_el_cafetal.png"):
-                st.image("assets/logo_el_cafetal.png", use_container_width=True)
+            render_logo(LOGO_CAFETAL_PATH, "El Cafetal")
         with c_title:
             st.markdown(
                 "<h3 style='text-align:center; color:#1B4332; margin-bottom:0;'>EPSDC Guerreros de la Montaña</h3>"
@@ -152,8 +184,7 @@ if st.session_state.usuario is None:
                 unsafe_allow_html=True
             )
         with c_logo2:
-            if os.path.exists("assets/logo_por_tu_cafe.png"):
-                st.image("assets/logo_por_tu_cafe.png", use_container_width=True)
+            render_logo(LOGO_PORTU_PATH, "Por Tu Café")
 
         st.markdown("---")
         st.subheader("Acceso al Sistema Administrativo y Control de Gestión")
@@ -196,11 +227,9 @@ tasa_bcv_global = estado_tasa["tasa_bcv"]
 with st.sidebar:
     c1, c2 = st.columns(2)
     with c1:
-        if os.path.exists("assets/logo_el_cafetal.png"):
-            st.image("assets/logo_el_cafetal.png", use_container_width=True)
+        render_logo(LOGO_CAFETAL_PATH, "El Cafetal")
     with c2:
-        if os.path.exists("assets/logo_por_tu_cafe.png"):
-            st.image("assets/logo_por_tu_cafe.png", use_container_width=True)
+        render_logo(LOGO_PORTU_PATH, "Por Tu Café")
 
     st.markdown(f"**Unidad Activa:**\n`{user['unidad']}`")
     st.markdown(f"**Responsable:** {user['nombre_completo']}")
@@ -295,7 +324,7 @@ if modulo_activo == "Panel Ejecutivo y Contraloría":
     with c_left:
         st.markdown("#### Existencias Actuales en Centro de Acopio y Almacén")
         st.dataframe(
-            df_inv[["sku", "nombre", "categoria", "stock_actual", "stock_minimo", "costo_unitario_usd", "precio_mayor_usd"]],
+            df_inv[["sku", "nombre", "categoria", "unidad_medida", "stock_actual", "stock_minimo", "costo_unitario_usd", "precio_detal_usd", "precio_mayor_usd", "ubicacion_bodega"]],
             use_container_width=True,
             hide_index=True
         )
@@ -329,22 +358,258 @@ if modulo_activo == "Panel Ejecutivo y Contraloría":
 # ==============================================================================
 elif modulo_activo == "1. Almacén, Recepción e Inventario":
     st.subheader("Unidad de Almacén, Recepción e Inventario (Custodia Física y Kardex)")
-    tab1, tab2, tab3 = st.tabs(["Registrar Entrada / Salida", "Inventario Maestro y Nuevos Rubros", "Historial Kardex y Actas PDF"])
+    tab_entrada, tab_sku, tab_mov, tab_kardex = st.tabs([
+        "Entrada en Almacén",
+        "Registro / Edición de SKU",
+        "Otras Salidas / Ajustes",
+        "Historial Kardex y Actas PDF"
+    ])
 
     df_inv = query_df("SELECT * FROM inventario")
 
-    with tab1:
-        st.markdown("#### Movimiento de Almacén (Recepción de Maquila/Cosecha o Ajuste)")
+    # --------------------------------------------------------------------------
+    # SUBMÓDULO EXCLUSIVO: ENTRADA EN ALMACÉN
+    # --------------------------------------------------------------------------
+    with tab_entrada:
+        st.markdown("#### Módulo de Entrada en Almacén (Recepción Física de Mercancía / Cosecha)")
+        st.caption("Registra el ingreso físico de unidades al stock, asigna lote y ubicación de bodega, y genera el Acta de Entrada en PDF.")
+
+        with st.form("form_entrada_almacen"):
+            c1, c2, c3 = st.columns(3)
+            prod_ent = c1.selectbox(
+                "SKU / Producto a Ingresar",
+                df_inv["sku"] + " | " + df_inv["nombre"] + " [" + df_inv["unidad_medida"] + "]"
+            )
+            cant_entrada = c2.number_input("Cantidad de Entrada", min_value=0.01, value=10.0, step=1.0)
+            lote_entrada = c3.text_input("Número de Lote / Cosecha", value=f"LOTE-{datetime.now().strftime('%Y%m%d')}")
+
+            c4, c5, c6 = st.columns(3)
+            origen_entrada = c4.text_input("Origen / Proveedor / Productor", value="Centro de Acopio / Torrefactora El Cafetal")
+            doc_soporte = c5.text_input("Documento Soporte (Orden / Guía / Factura)", placeholder="Ej: COMP-2026-0001")
+            ubicacion_entrada = c6.text_input("Ubicación en Bodega", value="Almacén Principal Nirgua")
+
+            obs_entrada = st.text_area("Inspección de Entrada (Peso, Humedad, Integridad del Empaque)")
+            submitted_entrada = st.form_submit_button("Confirmar Entrada en Almacén y Generar Acta PDF", type="primary")
+
+        if submitted_entrada:
+            if not origen_entrada.strip():
+                st.error("Debe indicar el Origen, Proveedor o Productor de la mercancía.")
+            else:
+                sku_e = prod_ent.split(" | ")[0]
+                prod_row = df_inv[df_inv["sku"] == sku_e].iloc[0]
+                cod_ent = generar_codigo("ENT", "movimientos_almacen")
+                fecha_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+                nuevo_stock = float(prod_row["stock_actual"]) + float(cant_entrada)
+                ubic_final = ubicacion_entrada.strip() or prod_row["ubicacion_bodega"]
+                obs_completa = f"Soporte: {doc_soporte.strip() or 'N/A'}. {obs_entrada.strip()}".strip()
+
+                conn = get_connection()
+                cur = conn.cursor()
+                cur.execute(
+                    "UPDATE inventario SET stock_actual = ?, ubicacion_bodega = ? WHERE sku = ?",
+                    (nuevo_stock, ubic_final, sku_e)
+                )
+                cur.execute(
+                    """
+                    INSERT INTO movimientos_almacen
+                    (codigo_doc, fecha, tipo_movimiento, sku, cantidad, lote, origen_destino, responsable, observaciones)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        cod_ent,
+                        fecha_str,
+                        "Entrada - Almacén",
+                        sku_e,
+                        float(cant_entrada),
+                        lote_entrada.strip(),
+                        origen_entrada.strip(),
+                        user["username"],
+                        obs_completa
+                    )
+                )
+                conn.commit()
+                conn.close()
+
+                pdf_bytes = generar_pdf_comprobante(
+                    titulo_documento="Acta de Entrada en Almacén",
+                    codigo_documento=cod_ent,
+                    unidad_emisora="Unidad de Almacén, Recepción e Inventario",
+                    datos_generales={
+                        "Tipo Movimiento": "Entrada en Almacén",
+                        "Fecha y Hora": fecha_str,
+                        "Origen / Proveedor": origen_entrada.strip(),
+                        "Doc. Soporte": doc_soporte.strip() or "N/A",
+                        "Lote": lote_entrada.strip() or "N/A",
+                        "Ubicación Bodega": ubic_final
+                    },
+                    columnas_tabla=["SKU", "Descripción", "Unidad", "Entrada", "Stock Actual"],
+                    filas_tabla=[[
+                        sku_e,
+                        prod_row["nombre"],
+                        prod_row["unidad_medida"],
+                        f"{cant_entrada:,.2f}",
+                        f"{nuevo_stock:,.2f}"
+                    ]],
+                    observaciones=obs_completa or "Entrada verificada y contabilizada en el inventario físico del almacén.",
+                    firmas=("Jefe de Almacén e Inventario", "Entrega / Transportista", "Contraloría Social")
+                )
+                st.session_state.ultimo_pdf_entrada_alm = pdf_bytes
+                st.session_state.ultimo_cod_entrada_alm = cod_ent
+                st.success(f"Entrada {cod_ent} registrada para {sku_e}. Nuevo stock: {nuevo_stock:,.2f} {prod_row['unidad_medida']}.")
+
+        if st.session_state.ultimo_pdf_entrada_alm is not None:
+            st.download_button(
+                label="Descargar Acta de Entrada en Almacén (PDF)",
+                data=st.session_state.ultimo_pdf_entrada_alm,
+                file_name=f"{st.session_state.ultimo_cod_entrada_alm}.pdf",
+                mime="application/pdf",
+                key="btn_descargar_entrada_almacen"
+            )
+
+        st.markdown("##### Últimas Entradas Registradas en Almacén")
+        df_entradas = query_df("SELECT * FROM movimientos_almacen WHERE tipo_movimiento LIKE 'Entrada%' ORDER BY id DESC")
+        st.dataframe(df_entradas, use_container_width=True, hide_index=True)
+
+    # --------------------------------------------------------------------------
+    # SUBMÓDULO: INGRESO Y ACTUALIZACIÓN DE SKU CON TODAS SUS PROPIEDADES
+    # --------------------------------------------------------------------------
+    with tab_sku:
+        st.markdown("#### Registrar o Actualizar SKU con sus Propiedades Completas")
+        st.caption("Campos estructurados: `sku`, `nombre`, `categoria`, `unidad_medida`, `stock_actual`, `stock_minimo`, `costo_unitario_usd`, `precio_detal_usd`, `precio_mayor_usd`, `ubicacion_bodega`.")
+
+        with st.form("form_sku_completo"):
+            c1, c2, c3, c4 = st.columns(4)
+            sku_val = c1.text_input("sku", placeholder="Ej: PTC-500").strip().upper()
+            nombre_val = c2.text_input("nombre", placeholder="Ej: Por Tu Café Molido Gourmet 500g")
+            categoria_val = c3.selectbox(
+                "categoria",
+                [
+                    "Producto Terminado - Café",
+                    "Materia Prima Agrícola",
+                    "Insumos Agrícolas",
+                    "Herramientas Agrícolas",
+                    "Otros Alimentos"
+                ]
+            )
+            unidad_medida_val = c4.text_input("unidad_medida", value="Bulto").strip()
+
+            c5, c6, c7 = st.columns(3)
+            stock_actual_val = c5.number_input("stock_actual", min_value=0.0, value=0.0, step=1.0, format="%.2f")
+            stock_minimo_val = c6.number_input("stock_minimo", min_value=0.0, value=10.0, step=1.0, format="%.2f")
+            costo_unitario_val = c7.number_input("costo_unitario_usd ($)", min_value=0.0, value=15.0, step=0.50, format="%.2f")
+
+            c8, c9, c10 = st.columns(3)
+            precio_detal_val = c8.number_input("precio_detal_usd ($)", min_value=0.0, value=22.0, step=0.50, format="%.2f")
+            precio_mayor_val = c9.number_input("precio_mayor_usd ($)", min_value=0.0, value=19.50, step=0.50, format="%.2f")
+            ubicacion_bodega_val = c10.text_input("ubicacion_bodega", value="Almacén Principal Nirgua").strip()
+
+            submitted_sku_full = st.form_submit_button("Guardar Propiedades del SKU", type="primary")
+
+        if submitted_sku_full:
+            if not sku_val or not nombre_val or not unidad_medida_val:
+                st.error("Debe completar al menos `sku`, `nombre` y `unidad_medida`.")
+            else:
+                conn = get_connection()
+                cur = conn.cursor()
+                cur.execute("SELECT COUNT(*) FROM inventario WHERE sku = ?", (sku_val,))
+                existe = cur.fetchone()[0] > 0
+
+                if existe:
+                    cur.execute(
+                        """
+                        UPDATE inventario
+                        SET nombre = ?, categoria = ?, unidad_medida = ?,
+                            stock_actual = ?, stock_minimo = ?, costo_unitario_usd = ?,
+                            precio_detal_usd = ?, precio_mayor_usd = ?, ubicacion_bodega = ?
+                        WHERE sku = ?
+                        """,
+                        (
+                            nombre_val,
+                            categoria_val,
+                            unidad_medida_val,
+                            float(stock_actual_val),
+                            float(stock_minimo_val),
+                            float(costo_unitario_val),
+                            float(precio_detal_val),
+                            float(precio_mayor_val),
+                            ubicacion_bodega_val or "Almacén Principal Nirgua",
+                            sku_val
+                        )
+                    )
+                    conn.commit()
+                    conn.close()
+                    st.success(f"Propiedades del SKU `{sku_val}` actualizadas correctamente.")
+                else:
+                    cur.execute(
+                        """
+                        INSERT INTO inventario
+                        (sku, nombre, categoria, unidad_medida, stock_actual, stock_minimo,
+                         costo_unitario_usd, precio_detal_usd, precio_mayor_usd, ubicacion_bodega)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            sku_val,
+                            nombre_val,
+                            categoria_val,
+                            unidad_medida_val,
+                            float(stock_actual_val),
+                            float(stock_minimo_val),
+                            float(costo_unitario_val),
+                            float(precio_detal_val),
+                            float(precio_mayor_val),
+                            ubicacion_bodega_val or "Almacén Principal Nirgua"
+                        )
+                    )
+                    if float(stock_actual_val) > 0:
+                        cod_ini = generar_codigo("ENT", "movimientos_almacen")
+                        fecha_ini = datetime.now().strftime("%Y-%m-%d %H:%M")
+                        cur.execute(
+                            """
+                            INSERT INTO movimientos_almacen
+                            (codigo_doc, fecha, tipo_movimiento, sku, cantidad, lote, origen_destino, responsable, observaciones)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                cod_ini,
+                                fecha_ini,
+                                "Entrada - Inventario Inicial SKU",
+                                sku_val,
+                                float(stock_actual_val),
+                                "INICIAL",
+                                ubicacion_bodega_val or "Almacén Principal Nirgua",
+                                user["username"],
+                                "Stock inicial asignado al crear el SKU."
+                            )
+                        )
+                    conn.commit()
+                    conn.close()
+                    st.success(f"SKU `{sku_val}` registrado con todas sus propiedades.")
+
+        df_inv_actual = query_df(
+            """
+            SELECT sku, nombre, categoria, unidad_medida, stock_actual, stock_minimo,
+                   costo_unitario_usd, precio_detal_usd, precio_mayor_usd, ubicacion_bodega
+            FROM inventario
+            ORDER BY sku ASC
+            """
+        )
+        st.dataframe(df_inv_actual, use_container_width=True, hide_index=True)
+
+    # --------------------------------------------------------------------------
+    # SUBMÓDULO: SALIDAS INTERNAS / AJUSTES DE ALMACÉN
+    # --------------------------------------------------------------------------
+    with tab_mov:
+        st.markdown("#### Salida por Consumo Interno, Traslado o Ajuste de Almacén")
         with st.form("form_mov_almacen"):
             c1, c2, c3 = st.columns(3)
-            tipo_mov = c1.selectbox("Tipo de Movimiento", ["Entrada - Recepción Mercancía", "Salida - Consumo / Merma / Traslado"])
+            tipo_mov = c1.selectbox("Tipo de Salida / Ajuste", ["Salida - Consumo / Merma / Traslado", "Entrada - Ajuste Positivo"])
             producto_sel = c2.selectbox("Rubro / SKU", df_inv["sku"] + " | " + df_inv["nombre"])
-            cantidad_mov = c3.number_input("Cantidad (Bultos / Sacos / Unidades)", min_value=1.0, step=1.0)
+            cantidad_mov = c3.number_input("Cantidad (Bultos / Sacos / Unidades)", min_value=0.01, value=1.0, step=1.0)
 
             c4, c5 = st.columns(2)
             lote_mov = c4.text_input("Número de Lote / Cosecha", value=f"LOTE-{datetime.now().strftime('%Y%m')}")
-            origen_mov = c5.text_input("Origen / Proveedor / Destino", value="Torrefactora El Cafetal - Portuguesa")
-            obs_mov = st.text_area("Observaciones de Control de Calidad (Humedad, Sellado, Peso)")
+            origen_mov = c5.text_input("Destino / Área Interna", value="Planta / Despacho Interno")
+            obs_mov = st.text_area("Motivo o Observaciones de Control de Calidad")
 
             submitted_alm = st.form_submit_button("Registrar Movimiento y Generar Acta PDF", type="primary")
 
@@ -354,28 +619,32 @@ elif modulo_activo == "1. Almacén, Recepción e Inventario":
             cod_doc = generar_codigo("ALM", "movimientos_almacen")
             fecha_str = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-            if "Salida" in tipo_mov and prod_row["stock_actual"] < cantidad_mov:
+            if "Salida" in tipo_mov and float(prod_row["stock_actual"]) < float(cantidad_mov):
                 st.error("Stock insuficiente en almacén para procesar esta salida.")
             else:
-                nuevo_stock = prod_row["stock_actual"] + cantidad_mov if "Entrada" in tipo_mov else prod_row["stock_actual"] - cantidad_mov
+                nuevo_stock = (
+                    float(prod_row["stock_actual"]) + float(cantidad_mov)
+                    if "Entrada" in tipo_mov
+                    else float(prod_row["stock_actual"]) - float(cantidad_mov)
+                )
                 conn = get_connection()
                 cur = conn.cursor()
                 cur.execute("UPDATE inventario SET stock_actual = ? WHERE sku = ?", (nuevo_stock, sku_sel))
                 cur.execute("""
                     INSERT INTO movimientos_almacen (codigo_doc, fecha, tipo_movimiento, sku, cantidad, lote, origen_destino, responsable, observaciones)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (cod_doc, fecha_str, tipo_mov, sku_sel, cantidad_mov, lote_mov, origen_mov, user["username"], obs_mov))
+                """, (cod_doc, fecha_str, tipo_mov, sku_sel, float(cantidad_mov), lote_mov, origen_mov, user["username"], obs_mov))
                 conn.commit()
                 conn.close()
 
                 pdf_bytes = generar_pdf_comprobante(
-                    titulo_documento="Acta de Recepción y Movimiento de Almacén",
+                    titulo_documento="Acta de Movimiento de Almacén",
                     codigo_documento=cod_doc,
                     unidad_emisora="Unidad de Almacén, Recepción e Inventario",
                     datos_generales={
                         "Tipo Operación": tipo_mov,
                         "Fecha y Hora": fecha_str,
-                        "Origen / Destino": origen_mov,
+                        "Destino / Área": origen_mov,
                         "Lote Asignado": lote_mov,
                         "Ubicación Física": prod_row["ubicacion_bodega"],
                         "Responsable": user["nombre_completo"]
@@ -391,48 +660,14 @@ elif modulo_activo == "1. Almacén, Recepción e Inventario":
 
         if st.session_state.ultimo_pdf_almacen is not None:
             st.download_button(
-                label="Descargar Acta de Almacén (PDF)",
+                label="Descargar Acta de Movimiento (PDF)",
                 data=st.session_state.ultimo_pdf_almacen,
                 file_name=f"{st.session_state.ultimo_cod_almacen}.pdf",
                 mime="application/pdf",
                 key="btn_descargar_acta_almacen"
             )
 
-    with tab2:
-        st.markdown("#### Incorporar Nuevo Rubro al Catálogo Maestro")
-        with st.form("form_nuevo_sku"):
-            c1, c2, c3 = st.columns(3)
-            n_sku = c1.text_input("Código SKU Único", placeholder="Ej: GRA-CAR-01")
-            n_nombre = c2.text_input("Nombre y Presentación", placeholder="Ej: Caraotas Negras Seleccionadas (Bulto x 20kg)")
-            n_cat = c3.selectbox("Categoría", ["Producto Terminado - Café", "Materia Prima Agrícola", "Insumos Agrícolas", "Herramientas Agrícolas", "Otros Alimentos"])
-
-            c4, c5, c6, c7 = st.columns(4)
-            n_medida = c4.text_input("Unidad Medida", value="Bulto")
-            n_min = c5.number_input("Stock Mínimo Alerta", min_value=1.0, value=10.0)
-            n_costo = c6.number_input("Costo Unitario ($)", min_value=0.0, value=15.0)
-            n_precio_m = c7.number_input("Precio Mayorista ($)", min_value=0.0, value=20.0)
-
-            submitted_sku = st.form_submit_button("Guardar Nuevo Producto en Catálogo")
-
-        if submitted_sku:
-            if n_sku and n_nombre:
-                conn = get_connection()
-                cur = conn.cursor()
-                try:
-                    cur.execute("""
-                        INSERT INTO inventario (sku, nombre, categoria, unidad_medida, stock_actual, stock_minimo, costo_unitario_usd, precio_detal_usd, precio_mayor_usd)
-                        VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)
-                    """, (n_sku.upper(), n_nombre, n_cat, n_medida, n_min, n_costo, n_precio_m * 1.12, n_precio_m))
-                    conn.commit()
-                    st.success(f"Rubro {n_sku.upper()} creado exitosamente.")
-                except Exception as e:
-                    st.error(f"Error al crear SKU: {e}")
-                finally:
-                    conn.close()
-
-        st.dataframe(df_inv, use_container_width=True, hide_index=True)
-
-    with tab3:
+    with tab_kardex:
         df_kardex = query_df("SELECT * FROM movimientos_almacen ORDER BY id DESC")
         st.dataframe(df_kardex, use_container_width=True, hide_index=True)
 
