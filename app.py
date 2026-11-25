@@ -10,7 +10,7 @@ from database import init_db, autenticar_usuario, get_connection, query_df, gene
 from pdf_generator import generar_pdf_comprobante
 
 st.set_page_config(
-    page_title="ERP EPSDC Guerreros de la Montaña Yaracuy",
+    page_title="ERP EPSDC Guerreros de la Montaña",
     page_icon="☕",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -20,8 +20,8 @@ st.set_page_config(
 # CONFIGURACIÓN DE ACTIVOS Y MARCAS
 # ==============================================================================
 BASE_DIR = Path(__file__).resolve().parent
-LOGO_CAFETAL_PATH = BASE_DIR / "assets" / "logo_el_cafetal.jpg"
-LOGO_PORTU_PATH = BASE_DIR / "assets" / "logo_portu_cafe.jpg"
+LOGO_CAFETAL_PATH = BASE_DIR / "assets" / "logo_el_cafetal.png"
+LOGO_PORTU_PATH = BASE_DIR / "assets" / "logo_por_tu_cafe.png"
 
 
 def render_logo(logo_path: Path, caption_fallback: str = ""):
@@ -40,10 +40,10 @@ init_db()
 
 TERRITORIOS_YARACUY = [
     "Circuito 01 - Eje Metropolitano",
-    "Circuito 02 - Eje Productivo Sur",
-    "Circuito 03 - Eje Centro-Occidente",
-    "Circuito 04 - Eje Centro-Norte",
-    "Circuiro 05 - Eje Bolívar / Veroes / Monge",
+    "Zona 02 - Eje Productivo Sur",
+    "Zona 03 - Eje Centro-Occidente",
+    "Zona 04 - Eje Centro-Norte",
+    "Zona 05 - Eje Bolívar / Veroes / Monge",
     "Circuito 06 - Eje Costero Morón / Pto. Cabello"
 ]
 
@@ -557,6 +557,748 @@ def calcular_kpis_comerciales(df_ventas: pd.DataFrame, df_preventas: pd.DataFram
         "morosidad_pct": morosidad_pct,
         "margen_bruto_usd": margen_bruto_usd
     }
+
+
+# ==============================================================================
+# CAPA FINANCIERA INTEGRADA (DECIMAL, TRANSACCIONES ATÓMICAS Y SERVICIOS)
+# ==============================================================================
+from dataclasses import dataclass, field
+from datetime import date as dt_date
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
+from typing import List, Optional
+
+CENTAVOS = Decimal("0.01")
+
+
+def redondear_moneda(valor: Decimal) -> Decimal:
+    return valor.quantize(CENTAVOS, rounding=ROUND_HALF_UP)
+
+
+def a_decimal(valor, por_defecto: str = "0.00") -> Decimal:
+    if isinstance(valor, Decimal):
+        return valor
+    if valor is None or str(valor).strip() == "":
+        return Decimal(por_defecto)
+    try:
+        return Decimal(str(valor).replace(",", "").strip())
+    except InvalidOperation:
+        return Decimal(por_defecto)
+
+
+@dataclass
+class LineaFactura:
+    descripcion: str
+    cantidad: Decimal
+    precio_unitario: Decimal
+    costo_unitario: Decimal
+    impuesto_tasa: Decimal = Decimal("0.00")
+
+    @property
+    def subtotal(self) -> Decimal:
+        return redondear_moneda(self.cantidad * self.precio_unitario)
+
+    @property
+    def monto_impuesto(self) -> Decimal:
+        return redondear_moneda(self.subtotal * self.impuesto_tasa)
+
+    @property
+    def total_linea(self) -> Decimal:
+        return redondear_moneda(self.subtotal + self.monto_impuesto)
+
+    @property
+    def costo_total_linea(self) -> Decimal:
+        return redondear_moneda(self.cantidad * self.costo_unitario)
+
+
+@dataclass
+class Factura:
+    numero: str
+    cliente_id: str
+    fecha_emision: dt_date
+    fecha_vencimiento: dt_date
+    moneda: str = "VES"
+    tasa_cambio: Decimal = Decimal("1.00")
+    lineas: List[LineaFactura] = field(default_factory=list)
+    monto_cobrado: Decimal = Decimal("0.00")
+    estado: str = "EMITIDA"  # EMITIDA | PARCIAL | PAGADA | ANULADA
+
+    @property
+    def subtotal(self) -> Decimal:
+        return redondear_moneda(sum((l.subtotal for l in self.lineas), Decimal("0.00")))
+
+    @property
+    def impuestos(self) -> Decimal:
+        return redondear_moneda(sum((l.monto_impuesto for l in self.lineas), Decimal("0.00")))
+
+    @property
+    def total(self) -> Decimal:
+        return redondear_moneda(self.subtotal + self.impuestos)
+
+    @property
+    def saldo_pendiente(self) -> Decimal:
+        if self.estado == "ANULADA":
+            return Decimal("0.00")
+        return max(Decimal("0.00"), redondear_moneda(self.total - self.monto_cobrado))
+
+
+class FacturacionService:
+    def registrar_cobro(self, factura: Factura, monto: Decimal) -> Factura:
+        monto_dec = redondear_moneda(a_decimal(monto))
+        if factura.estado == "ANULADA":
+            raise ValueError("No se puede cobrar una factura anulada.")
+        if monto_dec <= Decimal("0.00"):
+            raise ValueError("El monto del cobro debe ser mayor que cero.")
+        if monto_dec > factura.saldo_pendiente:
+            raise ValueError("El cobro supera el saldo pendiente de la factura.")
+
+        factura.monto_cobrado = redondear_moneda(factura.monto_cobrado + monto_dec)
+        factura.estado = "PAGADA" if factura.saldo_pendiente == Decimal("0.00") else "PARCIAL"
+        return factura
+
+
+class AnalisisFinancieroService:
+    def resumen_operativo(
+        self,
+        facturas: List[Factura],
+        gastos_operativos: Decimal,
+        presupuesto_asignado: Decimal,
+    ) -> dict:
+        gastos_dec = redondear_moneda(a_decimal(gastos_operativos))
+        pres_dec = redondear_moneda(a_decimal(presupuesto_asignado))
+        facturas_validas = [f for f in facturas if f.estado != "ANULADA"]
+        ventas_netas = redondear_moneda(sum((f.subtotal for f in facturas_validas), Decimal("0.00")))
+        costo_ventas = redondear_moneda(
+            sum(
+                (l.costo_total_linea for f in facturas_validas for l in f.lineas),
+                Decimal("0.00"),
+            )
+        )
+        cxc_pendiente = redondear_moneda(sum((f.saldo_pendiente for f in facturas_validas), Decimal("0.00")))
+        utilidad_bruta = redondear_moneda(ventas_netas - costo_ventas)
+        utilidad_operativa = redondear_moneda(utilidad_bruta - gastos_dec)
+        ejecucion_presupuestaria = (
+            redondear_moneda((gastos_dec / pres_dec) * Decimal("100"))
+            if pres_dec > Decimal("0.00")
+            else Decimal("0.00")
+        )
+
+        return {
+            "ventas_netas": ventas_netas,
+            "costo_ventas": costo_ventas,
+            "utilidad_bruta": utilidad_bruta,
+            "gastos_operativos": gastos_dec,
+            "utilidad_operativa": utilidad_operativa,
+            "cxc_pendiente": cxc_pendiente,
+            "ejecucion_presupuestaria_pct": ejecucion_presupuestaria,
+        }
+
+
+def asegurar_esquema_finanzas_robusto():
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS cuentas_tesoreria (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        codigo_cuenta TEXT UNIQUE NOT NULL,
+        nombre_cuenta TEXT NOT NULL,
+        tipo_cuenta TEXT NOT NULL,
+        moneda TEXT NOT NULL,
+        saldo_actual REAL NOT NULL DEFAULT 0.0,
+        estado TEXT NOT NULL DEFAULT 'Activa'
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS facturas_emitidas (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        numero_factura TEXT UNIQUE NOT NULL,
+        doc_origen TEXT DEFAULT '',
+        cliente_codigo TEXT NOT NULL,
+        cliente_nombre TEXT NOT NULL,
+        rif_cliente TEXT NOT NULL,
+        fecha_emision TEXT NOT NULL,
+        fecha_vencimiento TEXT NOT NULL,
+        moneda TEXT NOT NULL DEFAULT 'USD',
+        tasa_cambio REAL NOT NULL,
+        sku TEXT NOT NULL,
+        descripcion TEXT NOT NULL,
+        cantidad REAL NOT NULL,
+        precio_unitario_usd REAL NOT NULL,
+        costo_unitario_usd REAL NOT NULL,
+        descuento_pct REAL NOT NULL DEFAULT 0.0,
+        impuesto_pct REAL NOT NULL DEFAULT 0.0,
+        subtotal_usd REAL NOT NULL,
+        impuesto_usd REAL NOT NULL,
+        total_usd REAL NOT NULL,
+        total_bs REAL NOT NULL,
+        monto_cobrado_usd REAL NOT NULL DEFAULT 0.0,
+        saldo_pendiente_usd REAL NOT NULL DEFAULT 0.0,
+        estado_documento TEXT NOT NULL DEFAULT 'EMITIDA',
+        motivo_estado TEXT DEFAULT '',
+        responsable TEXT NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS movimientos_cxc (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        numero_factura TEXT NOT NULL,
+        cliente_codigo TEXT NOT NULL,
+        cliente_nombre TEXT NOT NULL,
+        fecha_movimiento TEXT NOT NULL,
+        tipo_movimiento TEXT NOT NULL,
+        monto_usd REAL NOT NULL,
+        monto_bs REAL NOT NULL,
+        referencia TEXT DEFAULT '',
+        responsable TEXT NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS compromisos_cxp (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        codigo_cxp TEXT UNIQUE NOT NULL,
+        doc_compra TEXT DEFAULT '',
+        proveedor TEXT NOT NULL,
+        rif_proveedor TEXT NOT NULL,
+        fecha_emision TEXT NOT NULL,
+        fecha_vencimiento TEXT NOT NULL,
+        prioridad TEXT NOT NULL DEFAULT 'Media',
+        monto_total_usd REAL NOT NULL,
+        monto_pagado_usd REAL NOT NULL DEFAULT 0.0,
+        saldo_pendiente_usd REAL NOT NULL,
+        descuento_pronto_pago_pct REAL NOT NULL DEFAULT 0.0,
+        estado_cxp TEXT NOT NULL DEFAULT 'PENDIENTE',
+        responsable TEXT NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS gastos_costos (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        codigo_registro TEXT UNIQUE NOT NULL,
+        fecha TEXT NOT NULL,
+        clasificacion TEXT NOT NULL,
+        naturaleza TEXT NOT NULL,
+        centro_costo TEXT NOT NULL,
+        rubro_o_sku TEXT NOT NULL,
+        concepto TEXT NOT NULL,
+        monto_usd REAL NOT NULL,
+        tasa_bcv REAL NOT NULL,
+        monto_bs REAL NOT NULL,
+        estado_aprobacion TEXT NOT NULL DEFAULT 'Aprobado',
+        responsable TEXT NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS presupuestos_partidas (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        periodo TEXT NOT NULL,
+        unidad_o_centro TEXT NOT NULL,
+        rubro TEXT NOT NULL,
+        monto_presupuestado_usd REAL NOT NULL,
+        actualizado_por TEXT NOT NULL,
+        fecha TEXT NOT NULL
+    )
+    """)
+
+    cur.execute("SELECT COUNT(*) FROM cuentas_tesoreria")
+    if cur.fetchone()[0] == 0:
+        cuentas_ini = [
+            ("CTA-CAJA-USD", "Caja Efectivo Divisas Sede", "Caja", "USD", 0.0, "Activa"),
+            ("CTA-CAJA-VES", "Caja Chica Bolívares", "Caja", "VES", 0.0, "Activa"),
+            ("CTA-BCO-VES", "Cuenta Bancaria Principal (BCV / Transferencia / Pago Móvil)", "Banco", "VES", 0.0, "Activa"),
+            ("CTA-DIG-USD", "Billetera / Canal Digital Divisas", "Digital", "USD", 0.0, "Activa")
+        ]
+        cur.executemany(
+            "INSERT INTO cuentas_tesoreria (codigo_cuenta, nombre_cuenta, tipo_cuenta, moneda, saldo_actual, estado) VALUES (?, ?, ?, ?, ?, ?)",
+            cuentas_ini
+        )
+
+    cur.execute("SELECT COUNT(*) FROM presupuestos_partidas")
+    if cur.fetchone()[0] == 0:
+        periodo_act = datetime.now().strftime("%Y-%m")
+        f_act = datetime.now().strftime("%Y-%m-%d %H:%M")
+        partidas_ini = [
+            (periodo_act, "Operaciones y Logística", "Logística, Fletes y Transporte", 1800.0, "gerencia", f_act),
+            (periodo_act, "Administración y Gestión", "Servicios, Nómina y Operación", 1500.0, "gerencia", f_act),
+            (periodo_act, "Compras y Acopio", "Acopio y Materia Prima", 4500.0, "gerencia", f_act),
+            (periodo_act, "Comercialización y Ventas", "Promoción y Despacho", 900.0, "gerencia", f_act)
+        ]
+        cur.executemany(
+            "INSERT INTO presupuestos_partidas (periodo, unidad_o_centro, rubro, monto_presupuestado_usd, actualizado_por, fecha) VALUES (?, ?, ?, ?, ?, ?)",
+            partidas_ini
+        )
+
+    conn.commit()
+    conn.close()
+
+
+asegurar_esquema_finanzas_robusto()
+
+
+def emitir_factura_atomica(
+    doc_origen: str,
+    cliente_codigo: str,
+    cliente_nombre: str,
+    rif_cliente: str,
+    fecha_emision_str: str,
+    fecha_vencimiento_str: str,
+    moneda: str,
+    tasa_bcv: float,
+    sku: str,
+    descripcion: str,
+    cantidad,
+    precio_unitario_usd,
+    costo_unitario_usd,
+    descuento_pct,
+    impuesto_pct,
+    condicion_pago: str,
+    responsable: str,
+    user_ctx: dict
+) -> dict:
+    cant_d = a_decimal(cantidad)
+    precio_d = a_decimal(precio_unitario_usd)
+    costo_d = a_decimal(costo_unitario_usd)
+    desc_d = a_decimal(descuento_pct)
+    imp_d = a_decimal(impuesto_pct)
+    tasa_d = a_decimal(tasa_bcv, "1.00")
+
+    if cant_d <= Decimal("0.00") or precio_d <= Decimal("0.00"):
+        raise ValueError("Cantidad y precio unitario deben ser mayores a cero.")
+
+    subtotal_bruto = redondear_moneda(cant_d * precio_d)
+    descuento_usd = redondear_moneda(subtotal_bruto * (desc_d / Decimal("100")))
+    base_imponible = max(Decimal("0.00"), redondear_moneda(subtotal_bruto - descuento_usd))
+    impuesto_usd = redondear_moneda(base_imponible * (imp_d / Decimal("100")))
+    total_usd = redondear_moneda(base_imponible + impuesto_usd)
+    total_bs = redondear_moneda(total_usd * tasa_d)
+
+    es_contado = (condicion_pago == "Contado")
+    cobrado_ini = total_usd if es_contado else Decimal("0.00")
+    saldo_ini = Decimal("0.00") if es_contado else total_usd
+    estado_doc = "PAGADA" if es_contado else "EMITIDA"
+
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        num_fac = generar_codigo("FAC", "facturas_emitidas")
+
+        cur.execute(
+            """
+            INSERT INTO facturas_emitidas
+            (numero_factura, doc_origen, cliente_codigo, cliente_nombre, rif_cliente,
+             fecha_emision, fecha_vencimiento, moneda, tasa_cambio, sku, descripcion,
+             cantidad, precio_unitario_usd, costo_unitario_usd, descuento_pct, impuesto_pct,
+             subtotal_usd, impuesto_usd, total_usd, total_bs, monto_cobrado_usd,
+             saldo_pendiente_usd, estado_documento, motivo_estado, responsable)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?)
+            """,
+            (
+                num_fac, doc_origen.strip(), cliente_codigo.strip(), cliente_nombre.strip(),
+                rif_cliente.strip(), fecha_emision_str, fecha_vencimiento_str, moneda,
+                float(tasa_d), sku, descripcion, float(cant_d), float(precio_d), float(costo_d),
+                float(desc_d), float(imp_d), float(base_imponible), float(impuesto_usd),
+                float(total_usd), float(total_bs), float(cobrado_ini), float(saldo_ini),
+                estado_doc, responsable
+            )
+        )
+
+        if saldo_ini > Decimal("0.00"):
+            cur.execute(
+                """
+                INSERT INTO movimientos_cxc
+                (numero_factura, cliente_codigo, cliente_nombre, fecha_movimiento,
+                 tipo_movimiento, monto_usd, monto_bs, referencia, responsable)
+                VALUES (?, ?, ?, ?, 'CARGO_FACTURA', ?, ?, ?, ?)
+                """,
+                (
+                    num_fac, cliente_codigo.strip(), cliente_nombre.strip(),
+                    fecha_emision_str, float(saldo_ini), float(redondear_moneda(saldo_ini * tasa_d)),
+                    doc_origen.strip() or num_fac, responsable
+                )
+            )
+            cur.execute(
+                """
+                UPDATE clientes_cartera
+                SET saldo_pendiente_usd = ROUND(saldo_pendiente_usd + ?, 2),
+                    fecha_ultima_compra = ?
+                WHERE codigo_cliente = ?
+                """,
+                (float(saldo_ini), fecha_emision_str[:10], cliente_codigo.strip())
+            )
+        elif es_contado:
+            cod_rec = generar_codigo("REC", "tesoreria")
+            cur.execute(
+                """
+                INSERT INTO tesoreria
+                (codigo_recibo, fecha, tipo_operacion, concepto, doc_asociado, tercero,
+                 metodo_pago, referencia, monto_usd, tasa_bcv, monto_bs, responsable)
+                VALUES (?, ?, 'Ingreso', ?, ?, ?, 'Contado / Facturación', ?, ?, ?, ?, ?)
+                """,
+                (
+                    cod_rec, fecha_emision_str, f"Cobro contado factura {num_fac} ({descripcion})",
+                    num_fac, cliente_nombre.strip(), num_fac, float(total_usd),
+                    float(tasa_d), float(total_bs), responsable
+                )
+            )
+            cur.execute(
+                "UPDATE cuentas_tesoreria SET saldo_actual = ROUND(saldo_actual + ?, 2) WHERE codigo_cuenta = 'CTA-CAJA-USD'",
+                (float(total_usd),)
+            )
+
+        conn.commit()
+        registrar_auditoria_comercial(user_ctx, "Finanzas", "EMITIR_FACTURA", num_fac, f"Total ${total_usd:,.2f} | Estado {estado_doc}")
+        return {"numero_factura": num_fac, "total_usd": total_usd, "total_bs": total_bs, "estado": estado_doc}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def registrar_cobro_cxc_atomico(
+    numero_factura: str,
+    monto_cobro,
+    retencion_usd,
+    codigo_cuenta: str,
+    metodo_pago: str,
+    referencia: str,
+    tasa_bcv: float,
+    responsable: str,
+    user_ctx: dict
+) -> dict:
+    cobro_d = redondear_moneda(a_decimal(monto_cobro))
+    ret_d = redondear_moneda(a_decimal(retencion_usd))
+    tasa_d = a_decimal(tasa_bcv, "1.00")
+    total_aplicado = redondear_moneda(cobro_d + ret_d)
+
+    if total_aplicado <= Decimal("0.00"):
+        raise ValueError("El monto del cobro o retención debe ser mayor a cero.")
+
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cur.execute("SELECT * FROM facturas_emitidas WHERE numero_factura = ?", (numero_factura,))
+        fac = cur.fetchone()
+        if not fac:
+            raise ValueError(f"No existe la factura {numero_factura}.")
+        if fac["estado_documento"] == "ANULADA":
+            raise ValueError("No se puede registrar cobro sobre una factura ANULADA.")
+
+        saldo_act = redondear_moneda(a_decimal(fac["saldo_pendiente_usd"]))
+        if total_aplicado > saldo_act:
+            raise ValueError(f"El monto aplicado (${total_aplicado:,.2f}) supera el saldo pendiente (${saldo_act:,.2f}).")
+
+        nuevo_cobrado = redondear_moneda(a_decimal(fac["monto_cobrado_usd"]) + total_aplicado)
+        nuevo_saldo = max(Decimal("0.00"), redondear_moneda(saldo_act - total_aplicado))
+        nuevo_estado = "PAGADA" if nuevo_saldo == Decimal("0.00") else "PARCIAL"
+        fecha_now = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+        cur.execute(
+            """
+            UPDATE facturas_emitidas
+            SET monto_cobrado_usd = ?, saldo_pendiente_usd = ?, estado_documento = ?
+            WHERE numero_factura = ?
+            """,
+            (float(nuevo_cobrado), float(nuevo_saldo), nuevo_estado, numero_factura)
+        )
+
+        cur.execute(
+            """
+            INSERT INTO movimientos_cxc
+            (numero_factura, cliente_codigo, cliente_nombre, fecha_movimiento,
+             tipo_movimiento, monto_usd, monto_bs, referencia, responsable)
+            VALUES (?, ?, ?, ?, 'ABONO_COBRANZA', ?, ?, ?, ?)
+            """,
+            (
+                numero_factura, fac["cliente_codigo"], fac["cliente_nombre"], fecha_now,
+                float(total_aplicado), float(redondear_moneda(total_aplicado * tasa_d)),
+                referencia.strip() or numero_factura, responsable
+            )
+        )
+
+        cur.execute(
+            """
+            UPDATE clientes_cartera
+            SET saldo_pendiente_usd = MAX(0.0, ROUND(saldo_pendiente_usd - ?, 2)),
+                estado_cliente = CASE WHEN MAX(0.0, ROUND(saldo_pendiente_usd - ?, 2)) = 0 AND estado_cliente = 'Moroso' THEN 'Activo' ELSE estado_cliente END
+            WHERE codigo_cliente = ?
+            """,
+            (float(total_aplicado), float(total_aplicado), fac["cliente_codigo"])
+        )
+
+        cod_rec = generar_codigo("REC", "tesoreria")
+        monto_bs_cobro = redondear_moneda(cobro_d * tasa_d)
+        cur.execute(
+            """
+            INSERT INTO tesoreria
+            (codigo_recibo, fecha, tipo_operacion, concepto, doc_asociado, tercero,
+             metodo_pago, referencia, monto_usd, tasa_bcv, monto_bs, responsable)
+            VALUES (?, ?, 'Ingreso', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                cod_rec, fecha_now, f"Cobro CxC factura {numero_factura} (Retención: ${ret_d:,.2f})",
+                numero_factura, fac["cliente_nombre"], metodo_pago, referencia.strip() or cod_rec,
+                float(cobro_d), float(tasa_d), float(monto_bs_cobro), responsable
+            )
+        )
+        cur.execute(
+            "UPDATE cuentas_tesoreria SET saldo_actual = ROUND(saldo_actual + ?, 2) WHERE codigo_cuenta = ?",
+            (float(cobro_d), codigo_cuenta)
+        )
+
+        conn.commit()
+        registrar_auditoria_comercial(user_ctx, "CxC", "COBRO_FACTURA", numero_factura, f"Cobro ${cobro_d:,.2f} + Ret ${ret_d:,.2f} | Saldo ${nuevo_saldo:,.2f}")
+        return {"codigo_recibo": cod_rec, "nuevo_saldo": nuevo_saldo, "estado": nuevo_estado}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def anular_o_emitir_nota_credito_factura(numero_factura: str, accion_doc: str, motivo: str, tasa_bcv: float, responsable: str, user_ctx: dict):
+    if not motivo.strip():
+        raise ValueError("Debe especificar el motivo de anulación o nota de crédito.")
+
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cur.execute("SELECT * FROM facturas_emitidas WHERE numero_factura = ?", (numero_factura,))
+        fac = cur.fetchone()
+        if not fac:
+            raise ValueError(f"Factura {numero_factura} no encontrada.")
+        if fac["estado_documento"] == "ANULADA":
+            raise ValueError("La factura ya se encuentra anulada.")
+
+        saldo_pend = redondear_moneda(a_decimal(fac["saldo_pendiente_usd"]))
+        fecha_now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        tasa_d = a_decimal(tasa_bcv, "1.00")
+
+        nuevo_estado = "ANULADA" if accion_doc == "Anular Factura" else "NOTA_CREDITO"
+        cur.execute(
+            """
+            UPDATE facturas_emitidas
+            SET estado_documento = ?, saldo_pendiente_usd = 0.0, motivo_estado = ?
+            WHERE numero_factura = ?
+            """,
+            (nuevo_estado, motivo.strip(), numero_factura)
+        )
+
+        if saldo_pend > Decimal("0.00"):
+            cur.execute(
+                """
+                INSERT INTO movimientos_cxc
+                (numero_factura, cliente_codigo, cliente_nombre, fecha_movimiento,
+                 tipo_movimiento, monto_usd, monto_bs, referencia, responsable)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    numero_factura, fac["cliente_codigo"], fac["cliente_nombre"], fecha_now,
+                    nuevo_estado, float(-saldo_pend), float(redondear_moneda(-saldo_pend * tasa_d)),
+                    motivo.strip(), responsable
+                )
+            )
+            cur.execute(
+                """
+                UPDATE clientes_cartera
+                SET saldo_pendiente_usd = MAX(0.0, ROUND(saldo_pendiente_usd - ?, 2))
+                WHERE codigo_cliente = ?
+                """,
+                (float(saldo_pend), fac["cliente_codigo"])
+            )
+
+        conn.commit()
+        registrar_auditoria_comercial(user_ctx, "Facturación", nuevo_estado, numero_factura, motivo.strip())
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def registrar_gasto_o_costo_atomico(
+    clasificacion: str,
+    naturaleza: str,
+    centro_costo: str,
+    rubro_o_sku: str,
+    concepto: str,
+    monto_usd,
+    tasa_bcv: float,
+    codigo_cuenta: str,
+    descontar_caja: bool,
+    responsable: str,
+    user_ctx: dict
+) -> str:
+    monto_d = redondear_moneda(a_decimal(monto_usd))
+    tasa_d = a_decimal(tasa_bcv, "1.00")
+    if monto_d <= Decimal("0.00"):
+        raise ValueError("El monto del gasto/costo debe ser mayor a cero.")
+    if not concepto.strip():
+        raise ValueError("Debe ingresar el concepto del gasto o costo.")
+
+    monto_bs = redondear_moneda(monto_d * tasa_d)
+    fecha_now = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cod_reg = generar_codigo("GST" if clasificacion.startswith("Gasto") else "CST", "gastos_costos")
+        cur.execute(
+            """
+            INSERT INTO gastos_costos
+            (codigo_registro, fecha, clasificacion, naturaleza, centro_costo,
+             rubro_o_sku, concepto, monto_usd, tasa_bcv, monto_bs, estado_aprobacion, responsable)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Aprobado', ?)
+            """,
+            (
+                cod_reg, fecha_now, clasificacion, naturaleza, centro_costo,
+                rubro_o_sku, concepto.strip(), float(monto_d), float(tasa_d), float(monto_bs), responsable
+            )
+        )
+
+        if descontar_caja:
+            cod_rec = generar_codigo("REC", "tesoreria")
+            cur.execute(
+                """
+                INSERT INTO tesoreria
+                (codigo_recibo, fecha, tipo_operacion, concepto, doc_asociado, tercero,
+                 metodo_pago, referencia, monto_usd, tasa_bcv, monto_bs, responsable)
+                VALUES (?, ?, 'Egreso', ?, ?, ?, 'Tesorería / Caja', ?, ?, ?, ?, ?)
+                """,
+                (
+                    cod_rec, fecha_now, f"[{clasificacion}] {concepto.strip()}",
+                    cod_reg, centro_costo, cod_reg, float(monto_d), float(tasa_d), float(monto_bs), responsable
+                )
+            )
+            cur.execute(
+                "UPDATE cuentas_tesoreria SET saldo_actual = ROUND(saldo_actual - ?, 2) WHERE codigo_cuenta = ?",
+                (float(monto_d), codigo_cuenta)
+            )
+
+        conn.commit()
+        registrar_auditoria_comercial(user_ctx, "CostosGastos", "REGISTRAR_COSTO_GASTO", cod_reg, f"{clasificacion} ({naturaleza}) ${monto_d:,.2f} en {centro_costo}")
+        return cod_reg
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def registrar_cxp_y_pago_atomico(
+    proveedor: str,
+    rif_proveedor: str,
+    doc_compra: str,
+    fecha_vencimiento_str: str,
+    prioridad: str,
+    monto_total_usd,
+    descuento_pronto_pago_pct,
+    responsable: str,
+    user_ctx: dict
+) -> str:
+    monto_d = redondear_moneda(a_decimal(monto_total_usd))
+    desc_pp = a_decimal(descuento_pronto_pago_pct)
+    if monto_d <= Decimal("0.00"):
+        raise ValueError("El monto del compromiso CxP debe ser mayor a cero.")
+
+    fecha_now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cod_cxp = generar_codigo("CXP", "compromisos_cxp")
+        cur.execute(
+            """
+            INSERT INTO compromisos_cxp
+            (codigo_cxp, doc_compra, proveedor, rif_proveedor, fecha_emision,
+             fecha_vencimiento, prioridad, monto_total_usd, monto_pagado_usd,
+             saldo_pendiente_usd, descuento_pronto_pago_pct, estado_cxp, responsable)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0.0, ?, ?, 'PENDIENTE', ?)
+            """,
+            (
+                cod_cxp, doc_compra.strip(), proveedor.strip(), rif_proveedor.strip(),
+                fecha_now[:10], fecha_vencimiento_str, prioridad, float(monto_d),
+                float(monto_d), float(desc_pp), responsable
+            )
+        )
+        conn.commit()
+        registrar_auditoria_comercial(user_ctx, "CxP", "CREAR_CXP", cod_cxp, f"Proveedor {proveedor} | Saldo ${monto_d:,.2f}")
+        return cod_cxp
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def abonar_cxp_atomico(codigo_cxp: str, monto_pago, codigo_cuenta: str, metodo_pago: str, referencia: str, tasa_bcv: float, responsable: str, user_ctx: dict):
+    pago_d = redondear_moneda(a_decimal(monto_pago))
+    tasa_d = a_decimal(tasa_bcv, "1.00")
+    if pago_d <= Decimal("0.00"):
+        raise ValueError("El monto del desembolso debe ser mayor a cero.")
+
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cur.execute("SELECT * FROM compromisos_cxp WHERE codigo_cxp = ?", (codigo_cxp,))
+        row = cur.fetchone()
+        if not row:
+            raise ValueError(f"Compromiso {codigo_cxp} no encontrado.")
+        saldo_act = redondear_moneda(a_decimal(row["saldo_pendiente_usd"]))
+        if pago_d > saldo_act:
+            raise ValueError(f"El pago (${pago_d:,.2f}) supera el saldo pendiente (${saldo_act:,.2f}).")
+
+        nuevo_pagado = redondear_moneda(a_decimal(row["monto_pagado_usd"]) + pago_d)
+        nuevo_saldo = max(Decimal("0.00"), redondear_moneda(saldo_act - pago_d))
+        nuevo_estado = "PAGADA" if nuevo_saldo == Decimal("0.00") else "PARCIAL"
+        fecha_now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        monto_bs = redondear_moneda(pago_d * tasa_d)
+
+        cur.execute(
+            """
+            UPDATE compromisos_cxp
+            SET monto_pagado_usd = ?, saldo_pendiente_usd = ?, estado_cxp = ?
+            WHERE codigo_cxp = ?
+            """,
+            (float(nuevo_pagado), float(nuevo_saldo), nuevo_estado, codigo_cxp)
+        )
+
+        cod_rec = generar_codigo("REC", "tesoreria")
+        cur.execute(
+            """
+            INSERT INTO tesoreria
+            (codigo_recibo, fecha, tipo_operacion, concepto, doc_asociado, tercero,
+             metodo_pago, referencia, monto_usd, tasa_bcv, monto_bs, responsable)
+            VALUES (?, ?, 'Egreso', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                cod_rec, fecha_now, f"Pago compromiso CxP {codigo_cxp}",
+                codigo_cxp, row["proveedor"], metodo_pago, referencia.strip() or cod_rec,
+                float(pago_d), float(tasa_d), float(monto_bs), responsable
+            )
+        )
+        cur.execute(
+            "UPDATE cuentas_tesoreria SET saldo_actual = ROUND(saldo_actual - ?, 2) WHERE codigo_cuenta = ?",
+            (float(pago_d), codigo_cuenta)
+        )
+
+        conn.commit()
+        registrar_auditoria_comercial(user_ctx, "CxP", "PAGAR_CXP", codigo_cxp, f"Pago ${pago_d:,.2f} | Saldo ${nuevo_saldo:,.2f}")
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
 
 
 # ==============================================================================
@@ -1191,50 +1933,205 @@ elif modulo_activo == "2. Compras y Acopio Agrícola":
         st.dataframe(query_df("SELECT * FROM compras ORDER BY id DESC"), use_container_width=True, hide_index=True)
 
 # ==============================================================================
-# MÓDULO 3: UNIDAD FINANCIERA, FACTURACIÓN Y TESORERÍA
+# ==============================================================================
+# MÓDULO 3: UNIDAD FINANCIERA, FACTURACIÓN, TESORERÍA Y ANÁLISIS INTEGRADO
 # ==============================================================================
 elif modulo_activo == "3. Finanzas, Facturación y Tesorería":
-    st.subheader("Unidad Financiera, Facturación y Tesorería")
-    tab1, tab2 = st.tabs(["Registrar Cobro / Pago y Emitir Comprobante PDF", "Libro de Caja y Conciliación Bancaria"])
+    st.subheader("Unidad Financiera, Facturación, Tesorería y Análisis Integral")
+    st.caption("Control atómico con Decimal: Facturación trazable, Tesorería y flujo de caja, CxC/CxP, Costos y Gastos, Presupuesto y Análisis Financiero.")
 
-    with tab1:
-        with st.form("form_tesoreria"):
+    df_inv_f = query_df("SELECT * FROM inventario")
+    df_cli_f = query_df("SELECT * FROM clientes_cartera ORDER BY nombre_comercio ASC")
+    df_prev_f = query_df("SELECT * FROM preventas ORDER BY id DESC")
+    df_fac_f = query_df("SELECT * FROM facturas_emitidas ORDER BY id DESC")
+    df_cxc_f = query_df("SELECT * FROM movimientos_cxc ORDER BY id DESC")
+    df_cxp_f = query_df("SELECT * FROM compromisos_cxp ORDER BY id DESC")
+    df_cta_f = query_df("SELECT * FROM cuentas_tesoreria ORDER BY id ASC")
+    df_teso_f = query_df("SELECT * FROM tesoreria ORDER BY id DESC")
+    df_gc_f = query_df("SELECT * FROM gastos_costos ORDER BY id DESC")
+    df_pres_f = query_df("SELECT * FROM presupuestos_partidas ORDER BY id DESC")
+
+    t_fac, t_teso, t_cxc_cxp, t_cg_pres, t_ana = st.tabs([
+        "1. Facturación y Control de Ingresos",
+        "2. Tesorería y Flujo de Caja",
+        "3. CxC y CxP",
+        "4. Costos, Gastos y Presupuesto",
+        "5. Análisis Financiero"
+    ])
+
+    # --------------------------------------------------------------------------
+    # 1. FACTURACIÓN Y CONTROL DE INGRESOS
+    # --------------------------------------------------------------------------
+    with t_fac:
+        st.markdown("### 1. Emisión Trazable de Facturas y Estados de Documento")
+        st.caption("Vincula preventas/órdenes aprobadas o emisiones directas, calcula impuestos/descuentos con Decimal y gestiona estados EMITIDA / PARCIAL / PAGADA / ANULADA / NOTA_CREDITO.")
+
+        with st.form("form_emitir_factura_f"):
             c1, c2, c3 = st.columns(3)
-            tipo_op = c1.selectbox("Tipo de Operación", ["Ingreso", "Egreso"])
-            tercero = c2.text_input("Cliente / Productor / Beneficiario", placeholder="Ej: Comercializadora Yaracuy C.A.")
-            doc_ref = c3.text_input("Documento Asociado (N° Venta o Compra)", placeholder="Ej: VTA-2026-0001")
+            prev_opts = ["Emisión Directa (Sin Preventa)"]
+            if not df_prev_f.empty:
+                prev_opts += (
+                    df_prev_f["codigo_preventa"] + " | " + df_prev_f["cliente_nombre"] +
+                    " | " + df_prev_f["sku"] + " (" + df_prev_f["estado_preventa"] + ")"
+                ).tolist()
+            origen_sel = c1.selectbox("Preventa / Orden Vinculada", prev_opts)
 
-            c4, c5, c6 = st.columns(3)
-            metodo = c4.selectbox("Instrumento de Pago", ["Pago Móvil", "Transferencia Bancaria", "Divisas Efectivo ($)", "Bolívares Efectivo", "Zelle / Digital"])
-            referencia = c5.text_input("N° Referencia / Serial", placeholder="Ej: 00984512")
-            monto_usd = c6.number_input("Monto de la Operación ($ USD)", min_value=0.1, value=100.0)
+            cli_opts_f = []
+            if not df_cli_f.empty:
+                cli_opts_f = (df_cli_f["codigo_cliente"] + " | " + df_cli_f["nombre_comercio"] + " [" + df_cli_f["rif_cedula"] + "]").tolist()
+            cli_fac_sel = c2.selectbox("Cliente Receptor", cli_opts_f if cli_opts_f else ["CLI-GEN | Cliente General [V-00000000]"])
+            cond_fac = c3.selectbox("Condición de Pago", ["Contado", "Crédito 7 Días", "Crédito 15 Días", "Crédito 30 Días"])
 
-            concepto = st.text_input("Concepto Detallado del Movimiento", placeholder="Ej: Cancelación total de pedido de Por Tu Café 100g y 200g")
+            c4, c5, c6, c7 = st.columns(4)
+            f_emision = c4.date_input("Fecha de Emisión", value=datetime.now().date())
+            f_venc = c5.date_input("Fecha de Vencimiento", value=(datetime.now() + timedelta(days=7)).date())
+            moneda_fac = c6.selectbox("Moneda de Factura", ["USD", "VES"])
+            escala_fac = c7.selectbox("Escala de Precio", ["Mayorista", "Detal / Bodega"])
 
+            c8, c9, c10, c11 = st.columns(4)
+            prod_fac_sel = c8.selectbox("SKU / Ítem", df_inv_f["sku"] + " | " + df_inv_f["nombre"])
+            cant_fac = c9.number_input("Cantidad", min_value=0.01, value=5.0, step=1.0, key="fac_cant")
+            desc_fac = c10.number_input("Descuento (%)", min_value=0.0, max_value=50.0, value=0.0, step=1.0, key="fac_desc")
+            imp_fac = c11.number_input("Impuesto / IVA (%)", min_value=0.0, max_value=30.0, value=16.0, step=1.0, key="fac_imp")
+
+            btn_emit_fac = st.form_submit_button("Emitir Factura (Transacción Atómica)", type="primary")
+
+        if btn_emit_fac:
+            try:
+                doc_orig_txt = "" if origen_sel.startswith("Emisión Directa") else origen_sel.split(" | ")[0]
+                cli_cod_txt = cli_fac_sel.split(" | ")[0]
+                if not df_cli_f.empty and cli_cod_txt in df_cli_f["codigo_cliente"].values:
+                    crow = df_cli_f[df_cli_f["codigo_cliente"] == cli_cod_txt].iloc[0]
+                    cli_nom_txt = crow["nombre_comercio"]
+                    rif_txt = crow["rif_cedula"]
+                else:
+                    cli_nom_txt = cli_fac_sel.split(" | ")[1].split(" [")[0] if " | " in cli_fac_sel else "Cliente General"
+                    rif_txt = "V-00000000"
+
+                sku_f = prod_fac_sel.split(" | ")[0]
+                prow = df_inv_f[df_inv_f["sku"] == sku_f].iloc[0]
+                precio_u_f = a_decimal(prow["precio_mayor_usd"] if escala_fac == "Mayorista" else prow["precio_detal_usd"])
+                if precio_u_f <= Decimal("0.00"):
+                    precio_u_f = redondear_moneda(a_decimal(prow["costo_unitario_usd"]) * Decimal("1.25"))
+
+                res_fac = emitir_factura_atomica(
+                    doc_origen=doc_orig_txt,
+                    cliente_codigo=cli_cod_txt,
+                    cliente_nombre=cli_nom_txt,
+                    rif_cliente=rif_txt,
+                    fecha_emision_str=f_emision.strftime("%Y-%m-%d"),
+                    fecha_vencimiento_str=f_venc.strftime("%Y-%m-%d"),
+                    moneda=moneda_fac,
+                    tasa_bcv=tasa_bcv_global,
+                    sku=sku_f,
+                    descripcion=prow["nombre"],
+                    cantidad=cant_fac,
+                    precio_unitario_usd=precio_u_f,
+                    costo_unitario_usd=prow["costo_unitario_usd"],
+                    descuento_pct=desc_fac,
+                    impuesto_pct=imp_fac,
+                    condicion_pago=cond_fac,
+                    responsable=user["username"],
+                    user_ctx=user
+                )
+                st.success(f"Factura `{res_fac['numero_factura']}` emitida por ${res_fac['total_usd']:,.2f} (Bs {res_fac['total_bs']:,.2f}) — Estado: `{res_fac['estado']}`.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Error al emitir factura: {e}")
+
+        st.markdown("#### Libro de Facturas Emitidas y Control de Estados")
+        st.dataframe(df_fac_f, use_container_width=True, hide_index=True)
+
+        if not df_fac_f.empty:
+            st.markdown("##### Anulación o Emisión de Nota de Crédito")
+            with st.form("form_anular_nc_f"):
+                c1, c2, c3 = st.columns(3)
+                fac_activas = df_fac_f[df_fac_f["estado_documento"] != "ANULADA"]
+                if not fac_activas.empty:
+                    fac_sel_an = c1.selectbox("Factura a Afectar", fac_activas["numero_factura"] + " | " + fac_activas["cliente_nombre"] + " [" + fac_activas["estado_documento"] + "]")
+                    acc_doc_f = c2.selectbox("Acción de Documento", ["Anular Factura", "Emitir Nota de Crédito"])
+                    motivo_doc_f = c3.text_input("Motivo / Justificación Contable", placeholder="Ej: Devolución de mercancía o error en orden")
+                    btn_afectar_fac = st.form_submit_button("Aplicar Anulación / Nota de Crédito", type="primary")
+                else:
+                    st.info("No hay facturas activas disponibles para anular o emitir nota de crédito.")
+                    btn_afectar_fac = False
+
+            if btn_afectar_fac:
+                try:
+                    num_f_sel = fac_sel_an.split(" | ")[0]
+                    anular_o_emitir_nota_credito_factura(num_f_sel, acc_doc_f, motivo_doc_f, tasa_bcv_global, user["username"], user)
+                    st.success(f"Documento `{num_f_sel}` actualizado bajo `{acc_doc_f}`.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(str(e))
+
+    # --------------------------------------------------------------------------
+    # 2. TESORERÍA Y FLUJO DE CAJA
+    # --------------------------------------------------------------------------
+    with t_teso:
+        st.markdown("### 2. Cuentas, Cajas, Canales Digitales y Flujo de Caja")
+        st.caption("Centraliza saldos por cuenta/canal, registra ingresos/egresos con comprobante PDF y proyecta flujo de caja a 7 y 30 días.")
+
+        if not df_cta_f.empty:
+            cols_cta = st.columns(len(df_cta_f))
+            for idx_c, (_, crow_t) in enumerate(df_cta_f.iterrows()):
+                s_dec = redondear_moneda(a_decimal(crow_t["saldo_actual"]))
+                eq_txt = f"Bs {redondear_moneda(s_dec * a_decimal(tasa_bcv_global)):,.2f}" if crow_t["moneda"] == "USD" else f"${redondear_moneda(s_dec / max(Decimal('1.00'), a_decimal(tasa_bcv_global))):,.2f}"
+                cols_cta[idx_c].metric(f"{crow_t['codigo_cuenta']} ({crow_t['moneda']})", f"{s_dec:,.2f}", eq_txt)
+
+        st.markdown("#### Registrar Movimiento de Tesorería y Emitir Comprobante PDF")
+        with st.form("form_tesoreria_f"):
+            c1, c2, c3 = st.columns(3)
+            tipo_op = c1.selectbox("Tipo de Operación", ["Ingreso", "Egreso"], key="teso_f_tipo")
+            cta_opts = df_cta_f["codigo_cuenta"] + " | " + df_cta_f["nombre_cuenta"] if not df_cta_f.empty else ["CTA-CAJA-USD | Caja Efectivo Divisas Sede"]
+            cta_sel_f = c2.selectbox("Cuenta / Caja / Canal", cta_opts)
+            tercero = c3.text_input("Cliente / Productor / Beneficiario", placeholder="Ej: Comercializadora Yaracuy C.A.")
+
+            c4, c5, c6, c7 = st.columns(4)
+            doc_ref = c4.text_input("Documento Asociado", placeholder="Ej: FAC-2026-0001 o COMP-2026-0001")
+            metodo = c5.selectbox("Instrumento de Pago", ["Pago Móvil", "Transferencia Bancaria", "Divisas Efectivo ($)", "Bolívares Efectivo", "Billetera / Digital"])
+            referencia = c6.text_input("N° Referencia / Comprobante", placeholder="Ej: 00984512")
+            monto_usd = c7.number_input("Monto de la Operación ($ USD)", min_value=0.01, value=100.0, step=10.0)
+
+            concepto = st.text_input("Concepto Detallado del Movimiento", placeholder="Ej: Conciliación de cobro / desembolso operativo")
             submitted_teso = st.form_submit_button("Registrar en Tesorería y Generar Comprobante PDF", type="primary")
 
         if submitted_teso:
             if not tercero.strip() or not concepto.strip():
                 st.error("Debe completar el Tercero y el Concepto del movimiento.")
             else:
-                cod_rec = generar_codigo("REC", "tesoreria")
+                monto_d = redondear_moneda(a_decimal(monto_usd))
+                tasa_d = a_decimal(tasa_bcv_global, "1.00")
+                monto_bs = redondear_moneda(monto_d * tasa_d)
+                cod_cta_sel = cta_sel_f.split(" | ")[0]
                 fecha_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-                monto_bs = monto_usd * tasa_bcv_global
 
                 conn = get_connection()
                 cur = conn.cursor()
-                cur.execute("""
-                    INSERT INTO tesoreria (codigo_recibo, fecha, tipo_operacion, concepto, doc_asociado, tercero, metodo_pago, referencia, monto_usd, tasa_bcv, monto_bs, responsable)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (cod_rec, fecha_str, tipo_op, concepto, doc_ref, tercero, metodo, referencia, monto_usd, tasa_bcv_global, monto_bs, user["username"]))
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    cod_rec = generar_codigo("REC", "tesoreria")
+                    cur.execute("""
+                        INSERT INTO tesoreria (codigo_recibo, fecha, tipo_operacion, concepto, doc_asociado, tercero, metodo_pago, referencia, monto_usd, tasa_bcv, monto_bs, responsable)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (cod_rec, fecha_str, tipo_op, concepto.strip(), doc_ref.strip(), tercero.strip(), metodo, referencia.strip(), float(monto_d), float(tasa_d), float(monto_bs), user["username"]))
 
-                if tipo_op == "Ingreso" and doc_ref.startswith("VTA-"):
-                    cur.execute("UPDATE ventas SET estado_cobro = 'Cobrado' WHERE codigo_venta = ?", (doc_ref.strip(),))
-                elif tipo_op == "Egreso" and doc_ref.startswith("COMP-"):
-                    cur.execute("UPDATE compras SET estado_pago = 'Pagado' WHERE codigo_compra = ?", (doc_ref.strip(),))
+                    delta_cta = float(monto_d) if tipo_op == "Ingreso" else float(-monto_d)
+                    cur.execute("UPDATE cuentas_tesoreria SET saldo_actual = ROUND(saldo_actual + ?, 2) WHERE codigo_cuenta = ?", (delta_cta, cod_cta_sel))
 
-                conn.commit()
+                    if tipo_op == "Ingreso" and doc_ref.strip().startswith("VTA-"):
+                        cur.execute("UPDATE ventas SET estado_cobro = 'Cobrado' WHERE codigo_venta = ?", (doc_ref.strip(),))
+                    elif tipo_op == "Egreso" and doc_ref.strip().startswith("COMP-"):
+                        cur.execute("UPDATE compras SET estado_pago = 'Pagado' WHERE codigo_compra = ?", (doc_ref.strip(),))
+                    conn.commit()
+                except Exception as e:
+                    conn.rollback()
+                    st.error(f"Error en transacción de tesorería: {e}")
+                    conn.close()
+                    st.stop()
                 conn.close()
+
+                registrar_auditoria_comercial(user, "Tesorería", f"TESO_{tipo_op.upper()}", cod_rec, f"{cod_cta_sel} | ${monto_d:,.2f} | {concepto.strip()}")
 
                 titulo_pdf = "Comprobante Oficial de Ingreso y Cobranza" if tipo_op == "Ingreso" else "Comprobante Oficial de Egreso y Pago"
                 pdf_bytes = generar_pdf_comprobante(
@@ -1243,24 +2140,25 @@ elif modulo_activo == "3. Finanzas, Facturación y Tesorería":
                     unidad_emisora="Unidad Financiera, Facturación y Tesorería",
                     datos_generales={
                         "Tipo Movimiento": tipo_op.upper(),
+                        "Cuenta / Canal": cod_cta_sel,
                         "Fecha Contable": fecha_str,
-                        "Tercero / Razón Social": tercero,
-                        "Doc. Asociado": doc_ref or "N/A",
-                        "Método de Pago": metodo,
-                        "Referencia Bancaria": referencia or "Efectivo en Caja"
+                        "Tercero / Razón Social": tercero.strip(),
+                        "Doc. Asociado": doc_ref.strip() or "N/A",
+                        "Método / Ref.": f"{metodo} | {referencia.strip() or 'N/A'}"
                     },
                     columnas_tabla=["Código", "Concepto Contable", "Tasa BCV", "Monto ($)", "Equivalente (Bs)"],
-                    filas_tabla=[[cod_rec, concepto, f"Bs {tasa_bcv_global:,.2f}", f"${monto_usd:,.2f}", f"Bs {monto_bs:,.2f}"]],
+                    filas_tabla=[[cod_rec, concepto.strip(), f"Bs {tasa_d:,.2f}", f"${monto_d:,.2f}", f"Bs {monto_bs:,.2f}"]],
                     totales={
-                        "MONTO LIQUIDADO ($):": f"${monto_usd:,.2f}",
+                        "MONTO LIQUIDADO ($):": f"${monto_d:,.2f}",
                         "MONTO LIQUIDADO (Bs):": f"Bs {monto_bs:,.2f}"
                     },
-                    observaciones="Operación conciliada y asentada en los libros auxiliares de la EPSDC Guerreros de la Montaña.",
+                    observaciones="Operación asentada con integridad transaccional en tesorería.",
                     firmas=("Administrador / Tesorero", "Recibido / Conforme", "Contraloría Social")
                 )
                 st.session_state.ultimo_pdf_tesoreria = pdf_bytes
                 st.session_state.ultimo_cod_tesoreria = cod_rec
-                st.success(f"Comprobante {cod_rec} emitido por ${monto_usd:,.2f} (Bs {monto_bs:,.2f}).")
+                st.success(f"Comprobante `{cod_rec}` emitido por ${monto_d:,.2f} (Bs {monto_bs:,.2f}).")
+                st.rerun()
 
         if st.session_state.ultimo_pdf_tesoreria is not None:
             st.download_button(
@@ -1268,11 +2166,476 @@ elif modulo_activo == "3. Finanzas, Facturación y Tesorería":
                 data=st.session_state.ultimo_pdf_tesoreria,
                 file_name=f"{st.session_state.ultimo_cod_tesoreria}.pdf",
                 mime="application/pdf",
-                key="btn_descargar_comprobante_teso"
+                key="btn_descargar_comprobante_teso_f"
             )
 
-    with tab2:
-        st.dataframe(query_df("SELECT * FROM tesoreria ORDER BY id DESC"), use_container_width=True, hide_index=True)
+        st.markdown("#### Proyección de Flujo de Caja (Corto Plazo)")
+        saldo_disp_teso = redondear_moneda(sum((a_decimal(r["saldo_actual"]) for _, r in df_cta_f.iterrows()), Decimal("0.00"))) if not df_cta_f.empty else Decimal("0.00")
+        cxc_proy = redondear_moneda(sum((a_decimal(r["saldo_pendiente_usd"]) for _, r in df_fac_f[df_fac_f["estado_documento"] != "ANULADA"].iterrows()), Decimal("0.00"))) if not df_fac_f.empty else Decimal("0.00")
+        cxp_proy = redondear_moneda(sum((a_decimal(r["saldo_pendiente_usd"]) for _, r in df_cxp_f[df_cxp_f["estado_cxp"] != "PAGADA"].iterrows()), Decimal("0.00"))) if not df_cxp_f.empty else Decimal("0.00")
+        flujo_proyectado = redondear_moneda(saldo_disp_teso + cxc_proy - cxp_proy)
+
+        p1, p2, p3, p4 = st.columns(4)
+        p1.metric("Saldo Disponible Cuentas ($)", f"${saldo_disp_teso:,.2f}")
+        p2.metric("(+) Cobros Esperados CxC ($)", f"${cxc_proy:,.2f}")
+        p3.metric("(-) Compromisos Pendientes CxP ($)", f"${cxp_proy:,.2f}")
+        p4.metric("Flujo Neto Proyectado ($)", f"${flujo_proyectado:,.2f}")
+
+        st.markdown("#### Libro de Caja, Movimientos y Conciliación")
+        st.dataframe(df_teso_f, use_container_width=True, hide_index=True)
+
+    # --------------------------------------------------------------------------
+    # 3. CUENTAS POR COBRAR (CxC) Y CUENTAS POR PAGAR (CxP)
+    # --------------------------------------------------------------------------
+    with t_cxc_cxp:
+        st.markdown("### 3. Cuentas por Cobrar (CxC) y Cuentas por Pagar (CxP)")
+
+        col_cxc, col_cxp = st.columns(2)
+
+        with col_cxc:
+            st.markdown("#### Cuentas por Cobrar (Antigüedad, Retenciones y Cobros)")
+            fac_cxc_pend = df_fac_f[(df_fac_f["estado_documento"] != "ANULADA") & (df_fac_f["saldo_pendiente_usd"] > 0)].copy() if not df_fac_f.empty else pd.DataFrame()
+            if not fac_cxc_pend.empty:
+                hoy_d = datetime.now().date()
+                antig_list = []
+                for _, fr in fac_cxc_pend.iterrows():
+                    try:
+                        fv = datetime.strptime(str(fr["fecha_vencimiento"])[:10], "%Y-%m-%d").date()
+                        dias_venc = (hoy_d - fv).days
+                    except Exception:
+                        dias_venc = 0
+                    bucket = "Por Vencer / Vigente" if dias_venc <= 0 else ("1-15 Días Vencido" if dias_venc <= 15 else ("16-30 Días Vencido" if dias_venc <= 30 else "+30 Días en Mora"))
+                    antig_list.append({
+                        "numero_factura": fr["numero_factura"],
+                        "cliente": fr["cliente_nombre"],
+                        "vencimiento": fr["fecha_vencimiento"],
+                        "dias_mora": max(0, dias_venc),
+                        "antiguedad": bucket,
+                        "saldo_usd": fr["saldo_pendiente_usd"]
+                    })
+                st.dataframe(pd.DataFrame(antig_list), use_container_width=True, hide_index=True)
+
+                with st.form("form_cobro_cxc_f"):
+                    f_cob_sel = st.selectbox("Factura Pendiente", fac_cxc_pend["numero_factura"] + " | " + fac_cxc_pend["cliente_nombre"] + " (Saldo: $" + fac_cxc_pend["saldo_pendiente_usd"].astype(str) + ")")
+                    c_abono, c_ret = st.columns(2)
+                    monto_ab_cxc = c_abono.number_input("Abono Efectivo / Transferencia ($)", min_value=0.0, value=25.0, step=5.0)
+                    monto_ret_cxc = c_ret.number_input("Retención Fiscal / IVA ($)", min_value=0.0, value=0.0, step=1.0)
+                    cta_cob_sel = st.selectbox("Cuenta Destino", df_cta_f["codigo_cuenta"] if not df_cta_f.empty else ["CTA-CAJA-USD"])
+                    ref_cob_cxc = st.text_input("Referencia de Cobro / Comprobante Retención", placeholder="Ej: REF-4410")
+                    btn_cob_cxc = st.form_submit_button("Registrar Cobro / Retención CxC", type="primary")
+
+                if btn_cob_cxc:
+                    try:
+                        num_f_c = f_cob_sel.split(" | ")[0]
+                        res_c = registrar_cobro_cxc_atomico(num_f_c, monto_ab_cxc, monto_ret_cxc, cta_cob_sel, "Cobranza CxC", ref_cob_cxc, tasa_bcv_global, user["username"], user)
+                        st.success(f"Cobro aplicado a `{num_f_c}` (Recibo `{res_c['codigo_recibo']}`). Saldo restante: ${res_c['nuevo_saldo']:,.2f} (`{res_c['estado']}`).")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(str(e))
+            else:
+                st.info("No hay facturas pendientes de cobro en CxC.")
+
+            st.markdown("##### Historial de Movimientos CxC")
+            st.dataframe(df_cxc_f, use_container_width=True, hide_index=True)
+
+        with col_cxp:
+            st.markdown("#### Cuentas por Pagar (Compromisos, Prioridad y Desembolsos)")
+            with st.form("form_crear_cxp_f"):
+                p_nom = st.text_input("Proveedor / Acreedor", placeholder="Ej: Cooperativa Cafetalera Nirgua")
+                p_rif, p_doc = st.columns(2)
+                rif_p_f = p_rif.text_input("RIF Proveedor", placeholder="Ej: J-40556677-8")
+                doc_c_f = p_doc.text_input("Doc. Compra / Orden", placeholder="Ej: COMP-2026-0001")
+                p_fv, p_pri, p_pp = st.columns(3)
+                fv_cxp = p_fv.date_input("Vencimiento", value=(datetime.now() + timedelta(days=15)).date())
+                pri_cxp = p_pri.selectbox("Prioridad", ["Alta", "Media", "Baja"])
+                pp_cxp = p_pp.number_input("Desc. Pronto Pago (%)", min_value=0.0, max_value=25.0, value=0.0, step=0.5)
+                m_cxp = st.number_input("Monto del Compromiso ($ USD)", min_value=0.01, value=250.0, step=25.0)
+                btn_add_cxp = st.form_submit_button("Registrar Compromiso CxP", type="primary")
+
+            if btn_add_cxp:
+                if not p_nom.strip():
+                    st.error("Indique el nombre del proveedor.")
+                else:
+                    try:
+                        cod_c_new = registrar_cxp_y_pago_atomico(p_nom, rif_p_f or "V-00000000", doc_c_f, fv_cxp.strftime("%Y-%m-%d"), pri_cxp, m_cxp, pp_cxp, user["username"], user)
+                        st.success(f"Compromiso `{cod_c_new}` registrado en CxP.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(str(e))
+
+            st.dataframe(df_cxp_f, use_container_width=True, hide_index=True)
+
+            cxp_pend = df_cxp_f[df_cxp_f["saldo_pendiente_usd"] > 0] if not df_cxp_f.empty else pd.DataFrame()
+            if not cxp_pend.empty:
+                with st.form("form_pagar_cxp_f"):
+                    cxp_s = st.selectbox("Compromiso Pendiente", cxp_pend["codigo_cxp"] + " | " + cxp_pend["proveedor"] + " (Saldo: $" + cxp_pend["saldo_pendiente_usd"].astype(str) + ")")
+                    pago_cxp_m = st.number_input("Monto a Desembolsar ($ USD)", min_value=0.01, value=50.0, step=10.0)
+                    cta_pag_s = st.selectbox("Cuenta Origen", df_cta_f["codigo_cuenta"] if not df_cta_f.empty else ["CTA-CAJA-USD"], key="cxp_cta")
+                    ref_pag_c = st.text_input("Referencia de Pago", placeholder="Ej: TRANSF-8821")
+                    btn_pag_cxp = st.form_submit_button("Ejecutar Pago a Proveedor")
+
+                if btn_pag_cxp:
+                    try:
+                        cod_cxp_target = cxp_s.split(" | ")[0]
+                        abonar_cxp_atomico(cod_cxp_target, pago_cxp_m, cta_pag_s, "Transferencia / Pago Proveedor", ref_pag_c, tasa_bcv_global, user["username"], user)
+                        st.success(f"Desembolso aplicado a `{cod_cxp_target}`.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(str(e))
+
+    # --------------------------------------------------------------------------
+    # 4. COSTOS, GASTOS Y PRESUPUESTO
+    # --------------------------------------------------------------------------
+    with t_cg_pres:
+        st.markdown("### 4. Clasificación de Costos/Gastos y Control Presupuestario")
+
+        col_cg, col_pr = st.columns([1.2, 1])
+
+        with col_cg:
+            st.markdown("#### Registrar Costo Directo/Indirecto o Gasto Operativo/Administrativo")
+            with st.form("form_gasto_costo_f"):
+                c1, c2, c3 = st.columns(3)
+                clasif_cg = c1.selectbox("Clasificación", ["Gasto Operativo", "Gasto Administrativo", "Costo Directo", "Costo Indirecto"])
+                nat_cg = c2.selectbox("Naturaleza", ["Fijo", "Variable"])
+                cc_cg = c3.selectbox("Centro de Costo", ["Operaciones y Logística", "Administración y Gestión", "Compras y Acopio", "Comercialización y Ventas"])
+
+                c4, c5, c6 = st.columns(3)
+                rubro_cg = c4.text_input("Rubro / SKU / Categoría", value="Operación General")
+                monto_cg = c5.number_input("Monto ($ USD)", min_value=0.01, value=75.0, step=10.0)
+                cta_cg = c6.selectbox("Cuenta para Desembolso", df_cta_f["codigo_cuenta"] if not df_cta_f.empty else ["CTA-CAJA-USD"], key="cg_cta")
+
+                conc_cg = st.text_input("Concepto del Gasto o Costo", placeholder="Ej: Flete ruta San Felipe - Nirgua / Mantenimiento / Servicio")
+                desc_c_bool = st.checkbox("Registrar salida inmediata en Tesorería", value=True)
+                btn_cg = st.form_submit_button("Guardar Costo / Gasto", type="primary")
+
+            if btn_cg:
+                try:
+                    cod_g_new = registrar_gasto_o_costo_atomico(clasif_cg, nat_cg, cc_cg, rubro_cg, conc_cg, monto_cg, tasa_bcv_global, cta_cg, desc_c_bool, user["username"], user)
+                    st.success(f"Registro `{cod_g_new}` guardado correctamente.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(str(e))
+
+            st.dataframe(df_gc_f, use_container_width=True, hide_index=True)
+
+        with col_pr:
+            st.markdown("#### Presupuesto vs. Ejecución Real por Centro de Costo")
+            with st.form("form_presupuesto_f"):
+                per_p = st.text_input("Período (YYYY-MM)", value=datetime.now().strftime("%Y-%m"))
+                cc_p = st.selectbox("Unidad / Centro de Costo", ["Operaciones y Logística", "Administración y Gestión", "Compras y Acopio", "Comercialización y Ventas"], key="pres_cc")
+                rub_p = st.text_input("Partida / Rubro", value="Presupuesto Operativo Mensual")
+                m_pres_p = st.number_input("Monto Presupuestado ($ USD)", min_value=0.0, value=1500.0, step=100.0)
+                btn_p = st.form_submit_button("Guardar Partida Presupuestaria")
+
+            if btn_p:
+                conn = get_connection()
+                cur = conn.cursor()
+                cur.execute(
+                    "INSERT INTO presupuestos_partidas (periodo, unidad_o_centro, rubro, monto_presupuestado_usd, actualizado_por, fecha) VALUES (?, ?, ?, ?, ?, ?)",
+                    (per_p.strip(), cc_p, rub_p.strip(), float(m_pres_p), user["username"], datetime.now().strftime("%Y-%m-%d %H:%M"))
+                )
+                conn.commit()
+                conn.close()
+                registrar_auditoria_comercial(user, "Presupuesto", "GUARDAR_PARTIDA", cc_p, f"{per_p} | ${m_pres_p:,.2f}")
+                st.success("Partida presupuestaria registrada.")
+                st.rerun()
+
+            if not df_pres_f.empty:
+                pres_grp = df_pres_f.groupby("unidad_o_centro", as_index=False)["monto_presupuestado_usd"].sum()
+                real_grp = df_gc_f.groupby("centro_costo", as_index=False)["monto_usd"].sum() if not df_gc_f.empty else pd.DataFrame(columns=["centro_costo", "monto_usd"])
+                comp_df = pd.merge(pres_grp, real_grp, left_on="unidad_o_centro", right_on="centro_costo", how="left").fillna({"monto_usd": 0.0})
+                comp_df["desviacion_usd"] = comp_df["monto_presupuestado_usd"] - comp_df["monto_usd"]
+                comp_df["ejecucion_pct"] = comp_df.apply(lambda r: round((r["monto_usd"] / r["monto_presupuestado_usd"] * 100.0), 1) if r["monto_presupuestado_usd"] > 0 else 0.0, axis=1)
+                st.dataframe(comp_df[["unidad_o_centro", "monto_presupuestado_usd", "monto_usd", "desviacion_usd", "ejecucion_pct"]], use_container_width=True, hide_index=True)
+
+    # --------------------------------------------------------------------------
+    # 5. ANÁLISIS FINANCIERO (LIQUIDEZ, RENTABILIDAD, GRÁFICOS Y PDF EJECUTIVO)
+    # --------------------------------------------------------------------------
+    with t_ana:
+        st.markdown("### 5. Análisis Financiero: Liquidez, Capital de Trabajo, Rentabilidad y Reportes")
+
+        facturas_obj = []
+        if not df_fac_f.empty:
+            for _, r in df_fac_f.iterrows():
+                try:
+                    fe_d = datetime.strptime(str(r["fecha_emision"])[:10], "%Y-%m-%d").date()
+                except Exception:
+                    fe_d = datetime.now().date()
+                try:
+                    fv_d = datetime.strptime(str(r["fecha_vencimiento"])[:10], "%Y-%m-%d").date()
+                except Exception:
+                    fv_d = fe_d
+                linea = LineaFactura(
+                    descripcion=str(r["descripcion"]),
+                    cantidad=a_decimal(r["cantidad"]),
+                    precio_unitario=a_decimal(r["precio_unitario_usd"]),
+                    costo_unitario=a_decimal(r["costo_unitario_usd"]),
+                    impuesto_tasa=a_decimal(r["impuesto_pct"]) / Decimal("100")
+                )
+                fac_obj = Factura(
+                    numero=str(r["numero_factura"]),
+                    cliente_id=str(r["cliente_codigo"]),
+                    fecha_emision=fe_d,
+                    fecha_vencimiento=fv_d,
+                    moneda=str(r["moneda"]),
+                    tasa_cambio=a_decimal(r["tasa_cambio"], "1.00"),
+                    lineas=[linea],
+                    monto_cobrado=a_decimal(r["monto_cobrado_usd"]),
+                    estado=str(r["estado_documento"])
+                )
+                facturas_obj.append(fac_obj)
+
+        gastos_op_tot = redondear_moneda(sum((a_decimal(r["monto_usd"]) for _, r in df_gc_f.iterrows()), Decimal("0.00"))) if not df_gc_f.empty else Decimal("0.00")
+        pres_asig_tot = redondear_moneda(sum((a_decimal(r["monto_presupuestado_usd"]) for _, r in df_pres_f.iterrows()), Decimal("0.00"))) if not df_pres_f.empty else Decimal("0.00")
+
+        svc_ana = AnalisisFinancieroService()
+        res_ana = svc_ana.resumen_operativo(facturas_obj, gastos_op_tot, pres_asig_tot)
+
+        saldo_caja_act = redondear_moneda(sum((a_decimal(r["saldo_actual"]) for _, r in df_cta_f.iterrows()), Decimal("0.00"))) if not df_cta_f.empty else Decimal("0.00")
+        cxp_pend_act = redondear_moneda(sum((a_decimal(r["saldo_pendiente_usd"]) for _, r in df_cxp_f[df_cxp_f["estado_cxp"] != "PAGADA"].iterrows()), Decimal("0.00"))) if not df_cxp_f.empty else Decimal("0.00")
+        capital_trabajo = redondear_moneda(saldo_caja_act + res_ana["cxc_pendiente"] - cxp_pend_act)
+        razon_liquidez = redondear_moneda((saldo_caja_act + res_ana["cxc_pendiente"]) / cxp_pend_act) if cxp_pend_act > Decimal("0.00") else Decimal("99.99")
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Ventas Netas Facturadas ($)", f"${res_ana['ventas_netas']:,.2f}", f"Costo: ${res_ana['costo_ventas']:,.2f}")
+        m2.metric("Utilidad Bruta ($)", f"${res_ana['utilidad_bruta']:,.2f}", f"Gastos/Costos: ${res_ana['gastos_operativos']:,.2f}")
+        m3.metric("Utilidad Operativa ($)", f"${res_ana['utilidad_operativa']:,.2f}", f"Ejecución Presup.: {res_ana['ejecucion_presupuestaria_pct']}%")
+        m4.metric("Capital de Trabajo ($)", f"${capital_trabajo:,.2f}", f"Liquidez (Act.Corto/CxP): {razon_liquidez}")
+
+        st.markdown("---")
+        st.markdown("#### Gráficos Interactivos: Desviación Presupuestaria y Flujo de Caja")
+        g_col1, g_col2 = st.columns(2)
+
+        with g_col1:
+            st.markdown("##### Desviación Presupuestaria por Centro de Costo ($ USD)")
+            if not df_pres_f.empty:
+                p_grp = df_pres_f.groupby("unidad_o_centro", as_index=False)["monto_presupuestado_usd"].sum()
+                r_grp = df_gc_f.groupby("centro_costo", as_index=False)["monto_usd"].sum() if not df_gc_f.empty else pd.DataFrame(columns=["centro_costo", "monto_usd"])
+                df_desv = pd.merge(p_grp, r_grp, left_on="unidad_o_centro", right_on="centro_costo", how="left").fillna({"monto_usd": 0.0})
+                df_desv["desviacion_usd"] = df_desv["monto_presupuestado_usd"] - df_desv["monto_usd"]
+
+                try:
+                    import plotly.graph_objects as go
+                    fig_p = go.Figure()
+                    fig_p.add_trace(go.Bar(
+                        name="Presupuestado ($)",
+                        x=df_desv["unidad_o_centro"],
+                        y=df_desv["monto_presupuestado_usd"],
+                        marker_color="#2D6A4F"
+                    ))
+                    fig_p.add_trace(go.Bar(
+                        name="Ejecutado Real ($)",
+                        x=df_desv["unidad_o_centro"],
+                        y=df_desv["monto_usd"],
+                        marker_color="#9B2226"
+                    ))
+                    fig_p.add_trace(go.Scatter(
+                        name="Desviación Neta ($)",
+                        x=df_desv["unidad_o_centro"],
+                        y=df_desv["desviacion_usd"],
+                        mode="lines+markers",
+                        marker=dict(size=8, color="#1D3557"),
+                        line=dict(width=2.5, dash="dot", color="#1D3557")
+                    ))
+                    fig_p.update_layout(
+                        barmode="group",
+                        xaxis_title="Centro de Costo / Unidad",
+                        yaxis_title="Monto ($ USD)",
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+                        height=360,
+                        margin=dict(l=20, r=20, t=40, b=20)
+                    )
+                    st.plotly_chart(fig_p, use_container_width=True)
+                except Exception:
+                    st.bar_chart(df_desv.set_index("unidad_o_centro")[["monto_presupuestado_usd", "monto_usd", "desviacion_usd"]])
+            else:
+                st.info("No hay partidas presupuestarias registradas para graficar desviaciones.")
+
+        with g_col2:
+            st.markdown("##### Evolución del Flujo de Caja (Entradas, Salidas y Saldo Acumulado)")
+            if not df_teso_f.empty:
+                df_fc = df_teso_f.copy()
+                df_fc["fecha_dia"] = df_fc["fecha"].astype(str).str.slice(0, 10)
+                df_fc["entrada_usd"] = df_fc.apply(lambda r: float(r["monto_usd"]) if str(r["tipo_operacion"]).lower() == "ingreso" else 0.0, axis=1)
+                df_fc["salida_usd"] = df_fc.apply(lambda r: float(r["monto_usd"]) if str(r["tipo_operacion"]).lower() == "egreso" else 0.0, axis=1)
+                df_fc_dia = df_fc.groupby("fecha_dia", as_index=False).agg(
+                    entradas=("entrada_usd", "sum"),
+                    salidas=("salida_usd", "sum")
+                ).sort_values("fecha_dia")
+                df_fc_dia["flujo_neto_dia"] = df_fc_dia["entradas"] - df_fc_dia["salidas"]
+                df_fc_dia["saldo_acumulado"] = df_fc_dia["flujo_neto_dia"].cumsum()
+
+                try:
+                    import plotly.graph_objects as go
+                    fig_fc = go.Figure()
+                    fig_fc.add_trace(go.Bar(
+                        name="Entradas ($)",
+                        x=df_fc_dia["fecha_dia"],
+                        y=df_fc_dia["entradas"],
+                        marker_color="#2A9D8F"
+                    ))
+                    fig_fc.add_trace(go.Bar(
+                        name="Salidas ($)",
+                        x=df_fc_dia["fecha_dia"],
+                        y=df_fc_dia["salidas"],
+                        marker_color="#E76F51"
+                    ))
+                    fig_fc.add_trace(go.Scatter(
+                        name="Saldo Acumulado ($)",
+                        x=df_fc_dia["fecha_dia"],
+                        y=df_fc_dia["saldo_acumulado"],
+                        mode="lines+markers",
+                        line=dict(color="#1B4332", width=3),
+                        marker=dict(size=7)
+                    ))
+                    fig_fc.update_layout(
+                        barmode="group",
+                        xaxis_title="Fecha de Operación",
+                        yaxis_title="Monto ($ USD)",
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+                        height=360,
+                        margin=dict(l=20, r=20, t=40, b=20)
+                    )
+                    st.plotly_chart(fig_fc, use_container_width=True)
+                except Exception:
+                    st.line_chart(df_fc_dia.set_index("fecha_dia")[["entradas", "salidas", "saldo_acumulado"]])
+            else:
+                st.info("No hay movimientos de tesorería registrados para graficar el flujo de caja.")
+
+        st.markdown("---")
+        st.markdown("#### Reporte PDF Ejecutivo y Exportación Financiera (.XLSX)")
+        exp_c1, exp_c2 = st.columns(2)
+
+        with exp_c1:
+            if st.button("Generar Reporte PDF Ejecutivo Financiero", type="primary", use_container_width=True):
+                cod_rep_fin = f"REP-FIN-{datetime.now().strftime('%Y%m%d-%H%M')}"
+                tasa_dec = a_decimal(tasa_bcv_global)
+                filas_resumen_pdf = [
+                    ["[RESUMEN] Ventas Netas Facturadas", f"${res_ana['ventas_netas']:,.2f}", f"Bs {redondear_moneda(res_ana['ventas_netas'] * tasa_dec):,.2f}"],
+                    ["[RESUMEN] Costo Directo de Ventas", f"${res_ana['costo_ventas']:,.2f}", f"Bs {redondear_moneda(res_ana['costo_ventas'] * tasa_dec):,.2f}"],
+                    ["[RESUMEN] Utilidad Bruta", f"${res_ana['utilidad_bruta']:,.2f}", f"Bs {redondear_moneda(res_ana['utilidad_bruta'] * tasa_dec):,.2f}"],
+                    ["[RESUMEN] Gastos / Costos Registrados", f"${res_ana['gastos_operativos']:,.2f}", f"Bs {redondear_moneda(res_ana['gastos_operativos'] * tasa_dec):,.2f}"],
+                    ["[RESUMEN] Utilidad Operativa", f"${res_ana['utilidad_operativa']:,.2f}", f"Bs {redondear_moneda(res_ana['utilidad_operativa'] * tasa_dec):,.2f}"],
+                    ["[RESUMEN] Cuentas por Cobrar Pendientes", f"${res_ana['cxc_pendiente']:,.2f}", f"Bs {redondear_moneda(res_ana['cxc_pendiente'] * tasa_dec):,.2f}"],
+                    ["[RESUMEN] Cuentas por Pagar Pendientes", f"${cxp_pend_act:,.2f}", f"Bs {redondear_moneda(cxp_pend_act * tasa_dec):,.2f}"],
+                    ["[RESUMEN] Saldo Disponible en Tesorería", f"${saldo_caja_act:,.2f}", f"Bs {redondear_moneda(saldo_caja_act * tasa_dec):,.2f}"],
+                    ["[RESUMEN] Capital de Trabajo Neto", f"${capital_trabajo:,.2f}", f"Bs {redondear_moneda(capital_trabajo * tasa_dec):,.2f}"]
+                ]
+
+                # Desglose de Rentabilidad por SKU
+                fac_validas_df = df_fac_f[df_fac_f["estado_documento"] != "ANULADA"].copy() if not df_fac_f.empty else pd.DataFrame()
+                if not fac_validas_df.empty:
+                    sku_stats = {}
+                    for _, r_sku in fac_validas_df.iterrows():
+                        s_cod = str(r_sku["sku"])
+                        s_nom = str(r_sku["descripcion"])
+                        v_neta = redondear_moneda(a_decimal(r_sku["subtotal_usd"]))
+                        c_tot = redondear_moneda(a_decimal(r_sku["cantidad"]) * a_decimal(r_sku["costo_unitario_usd"]))
+                        if s_cod not in sku_stats:
+                            sku_stats[s_cod] = {"nombre": s_nom, "ventas": Decimal("0.00"), "costo": Decimal("0.00")}
+                        sku_stats[s_cod]["ventas"] = redondear_moneda(sku_stats[s_cod]["ventas"] + v_neta)
+                        sku_stats[s_cod]["costo"] = redondear_moneda(sku_stats[s_cod]["costo"] + c_tot)
+
+                    for s_cod, st_data in sorted(sku_stats.items(), key=lambda x: x[1]["ventas"] - x[1]["costo"], reverse=True):
+                        util_sku = redondear_moneda(st_data["ventas"] - st_data["costo"])
+                        margen_sku = redondear_moneda((util_sku / st_data["ventas"]) * Decimal("100")) if st_data["ventas"] > Decimal("0.00") else Decimal("0.00")
+                        filas_resumen_pdf.append([
+                            f"[SKU {s_cod}] {st_data['nombre'][:28]} (Ventas: ${st_data['ventas']:,.2f})",
+                            f"${util_sku:,.2f}",
+                            f"Margen: {margen_sku}%"
+                        ])
+                else:
+                    filas_resumen_pdf.append(["[RENTABILIDAD SKU] Sin facturas activas registradas", "$0.00", "Margen: 0.00%"])
+
+                # Desglose de Antigüedad de Cartera (CxC)
+                hoy_corte = datetime.now().date()
+                buckets_cxc = {
+                    "Por Vencer / Vigente (0 días)": {"monto": Decimal("0.00"), "docs": 0},
+                    "Vencida 1 - 15 Días": {"monto": Decimal("0.00"), "docs": 0},
+                    "Vencida 16 - 30 Días": {"monto": Decimal("0.00"), "docs": 0},
+                    "Mora Crítica (+30 Días)": {"monto": Decimal("0.00"), "docs": 0},
+                }
+                if not fac_validas_df.empty:
+                    for _, r_cxc in fac_validas_df[fac_validas_df["saldo_pendiente_usd"] > 0].iterrows():
+                        saldo_doc = redondear_moneda(a_decimal(r_cxc["saldo_pendiente_usd"]))
+                        try:
+                            fv_doc = datetime.strptime(str(r_cxc["fecha_vencimiento"])[:10], "%Y-%m-%d").date()
+                            dias_m = (hoy_corte - fv_doc).days
+                        except Exception:
+                            dias_m = 0
+                        if dias_m <= 0:
+                            b_key = "Por Vencer / Vigente (0 días)"
+                        elif dias_m <= 15:
+                            b_key = "Vencida 1 - 15 Días"
+                        elif dias_m <= 30:
+                            b_key = "Vencida 16 - 30 Días"
+                        else:
+                            b_key = "Mora Crítica (+30 Días)"
+                        buckets_cxc[b_key]["monto"] = redondear_moneda(buckets_cxc[b_key]["monto"] + saldo_doc)
+                        buckets_cxc[b_key]["docs"] += 1
+
+                tot_cxc_antig = sum((v["monto"] for v in buckets_cxc.values()), Decimal("0.00"))
+                for b_label, b_info in buckets_cxc.items():
+                    pct_cart = redondear_moneda((b_info["monto"] / tot_cxc_antig) * Decimal("100")) if tot_cxc_antig > Decimal("0.00") else Decimal("0.00")
+                    filas_resumen_pdf.append([
+                        f"[CARTERA CxC] {b_label} ({b_info['docs']} doc.)",
+                        f"${b_info['monto']:,.2f}",
+                        f"{pct_cart}% | Bs {redondear_moneda(b_info['monto'] * tasa_dec):,.2f}"
+                    ])
+
+                pdf_ejecutivo = generar_pdf_comprobante(
+                    titulo_documento="Reporte Ejecutivo Financiero, Rentabilidad por SKU y Cartera",
+                    codigo_documento=cod_rep_fin,
+                    unidad_emisora="Unidad Financiera, Facturación, Tesorería y Análisis",
+                    datos_generales={
+                        "Fecha de Corte": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                        "Tasa BCV Vigente": f"Bs {tasa_bcv_global:,.2f} / $",
+                        "Ejecución Presupuestaria": f"{res_ana['ejecucion_presupuestaria_pct']}%",
+                        "Razón de Liquidez": f"{razon_liquidez}",
+                        "Presupuesto Asignado": f"${pres_asig_tot:,.2f}",
+                        "Emitido Por": user["nombre_completo"]
+                    },
+                    columnas_tabla=["Sección / Concepto Ejecutivo", "Monto ($ USD)", "Detalle / Margen / Bs"],
+                    filas_tabla=filas_resumen_pdf,
+                    totales={
+                        "UTILIDAD OPERATIVA ($):": f"${res_ana['utilidad_operativa']:,.2f}",
+                        "CAPITAL DE TRABAJO ($):": f"${capital_trabajo:,.2f}"
+                    },
+                    observaciones="Incluye estado financiero consolidado, utilidad bruta y margen porcentual por SKU, y estratificación de antigüedad de cuentas por cobrar con aritmética Decimal.",
+                    firmas=("Administración y Finanzas", "Gerencia General", "Contraloría Social")
+                )
+                st.session_state["ultimo_pdf_ejecutivo_fin"] = pdf_ejecutivo
+                st.session_state["ultimo_cod_ejecutivo_fin"] = cod_rep_fin
+                registrar_auditoria_comercial(user, "Análisis Financiero", "REPORTE_PDF_EJECUTIVO", cod_rep_fin, f"Utilidad Op: ${res_ana['utilidad_operativa']:,.2f} | Cap. Trabajo: ${capital_trabajo:,.2f}")
+                st.success(f"Reporte PDF ejecutivo `{cod_rep_fin}` listo para descargar.")
+
+            if st.session_state.get("ultimo_pdf_ejecutivo_fin") is not None:
+                st.download_button(
+                    label="Descargar Reporte PDF Ejecutivo",
+                    data=st.session_state["ultimo_pdf_ejecutivo_fin"],
+                    file_name=f"{st.session_state.get('ultimo_cod_ejecutivo_fin', 'Reporte_Ejecutivo')}.pdf",
+                    mime="application/pdf",
+                    key="btn_descargar_pdf_ejecutivo_fin",
+                    use_container_width=True
+                )
+
+        with exp_c2:
+            buf_fin = io.BytesIO()
+            with pd.ExcelWriter(buf_fin, engine="openpyxl") as writer:
+                df_fac_f.to_excel(writer, sheet_name="Facturas", index=False)
+                df_cxc_f.to_excel(writer, sheet_name="Movimientos_CxC", index=False)
+                df_cxp_f.to_excel(writer, sheet_name="Compromisos_CxP", index=False)
+                df_cta_f.to_excel(writer, sheet_name="Cuentas_Tesoreria", index=False)
+                df_teso_f.to_excel(writer, sheet_name="Libro_Tesoreria", index=False)
+                df_gc_f.to_excel(writer, sheet_name="Costos_Gastos", index=False)
+                df_pres_f.to_excel(writer, sheet_name="Presupuesto", index=False)
+            st.download_button(
+                label="Descargar Paquete Financiero Completo (.XLSX)",
+                data=buf_fin.getvalue(),
+                file_name=f"Analisis_Financiero_EPSDC_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
 
 # ==============================================================================
 # MÓDULO 4: UNIDAD DE DESPACHO, COMERCIALIZACIÓN Y VENTAS (INTEGRAL)
