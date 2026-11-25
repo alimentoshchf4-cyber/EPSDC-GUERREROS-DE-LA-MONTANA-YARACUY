@@ -60,6 +60,15 @@ st.markdown("""
 if "usuario" not in st.session_state:
     st.session_state.usuario = None
 
+for key in [
+    "ultimo_pdf_almacen", "ultimo_cod_almacen",
+    "ultimo_pdf_compra", "ultimo_cod_compra",
+    "ultimo_pdf_tesoreria", "ultimo_cod_tesoreria",
+    "ultimo_pdf_venta", "ultimo_cod_venta"
+]:
+    if key not in st.session_state:
+        st.session_state[key] = None
+
 # ==============================================================================
 # PANTALLA DE INICIO DE SESIÓN POR UNIDAD ADMINISTRATIVA
 # ==============================================================================
@@ -239,45 +248,57 @@ elif modulo_activo == "1. Almacén, Recepción e Inventario":
             origen_mov = c5.text_input("Origen / Proveedor / Destino", value="Torrefactora El Cafetal - Portuguesa")
             obs_mov = st.text_area("Observaciones de Control de Calidad (Humedad, Sellado, Peso)")
 
-            if st.form_submit_button("Registrar Movimiento y Generar Acta PDF", type="primary"):
-                sku_sel = producto_sel.split(" | ")[0]
-                prod_row = df_inv[df_inv["sku"] == sku_sel].iloc[0]
-                cod_doc = generar_codigo("ALM", "movimientos_almacen")
-                fecha_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+            submitted_alm = st.form_submit_button("Registrar Movimiento y Generar Acta PDF", type="primary")
 
-                if "Salida" in tipo_mov and prod_row["stock_actual"] < cantidad_mov:
-                    st.error("Stock insuficiente en almacén para procesar esta salida.")
-                else:
-                    nuevo_stock = prod_row["stock_actual"] + cantidad_mov if "Entrada" in tipo_mov else prod_row["stock_actual"] - cantidad_mov
-                    conn = get_connection()
-                    cur = conn.cursor()
-                    cur.execute("UPDATE inventario SET stock_actual = ? WHERE sku = ?", (nuevo_stock, sku_sel))
-                    cur.execute("""
-                        INSERT INTO movimientos_almacen (codigo_doc, fecha, tipo_movimiento, sku, cantidad, lote, origen_destino, responsable, observaciones)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (cod_doc, fecha_str, tipo_mov, sku_sel, cantidad_mov, lote_mov, origen_mov, user["username"], obs_mov))
-                    conn.commit()
-                    conn.close()
+        if submitted_alm:
+            sku_sel = producto_sel.split(" | ")[0]
+            prod_row = df_inv[df_inv["sku"] == sku_sel].iloc[0]
+            cod_doc = generar_codigo("ALM", "movimientos_almacen")
+            fecha_str = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-                    pdf_bytes = generar_pdf_comprobante(
-                        titulo_documento="Acta de Recepción y Movimiento de Almacén",
-                        codigo_documento=cod_doc,
-                        unidad_emisora="Unidad de Almacén, Recepción e Inventario",
-                        datos_generales={
-                            "Tipo Operación": tipo_mov,
-                            "Fecha y Hora": fecha_str,
-                            "Origen / Destino": origen_mov,
-                            "Lote Asignado": lote_mov,
-                            "Ubicación Física": prod_row["ubicacion_bodega"],
-                            "Responsable": user["nombre_completo"]
-                        },
-                        columnas_tabla=["SKU", "Descripción del Rubro", "Medida", "Cantidad", "Saldo Final"],
-                        filas_tabla=[[sku_sel, prod_row["nombre"], prod_row["unidad_medida"], f"{cantidad_mov:,.2f}", f"{nuevo_stock:,.2f}"]],
-                        observaciones=obs_mov or "Verificado peso, integridad de empaque y condiciones de almacenamiento.",
-                        firmas=("Jefe de Almacén e Inventario", "Transportista / Entregado Por", "Contraloría Social")
-                    )
-                    st.success(f"Movimiento {cod_doc} registrado correctamente. Nuevo stock: {nuevo_stock:,.2f}")
-                    st.download_button("Descargar Acta de Almacén (PDF)", data=pdf_bytes, file_name=f"{cod_doc}.pdf", mime="application/pdf")
+            if "Salida" in tipo_mov and prod_row["stock_actual"] < cantidad_mov:
+                st.error("Stock insuficiente en almacén para procesar esta salida.")
+            else:
+                nuevo_stock = prod_row["stock_actual"] + cantidad_mov if "Entrada" in tipo_mov else prod_row["stock_actual"] - cantidad_mov
+                conn = get_connection()
+                cur = conn.cursor()
+                cur.execute("UPDATE inventario SET stock_actual = ? WHERE sku = ?", (nuevo_stock, sku_sel))
+                cur.execute("""
+                    INSERT INTO movimientos_almacen (codigo_doc, fecha, tipo_movimiento, sku, cantidad, lote, origen_destino, responsable, observaciones)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (cod_doc, fecha_str, tipo_mov, sku_sel, cantidad_mov, lote_mov, origen_mov, user["username"], obs_mov))
+                conn.commit()
+                conn.close()
+
+                pdf_bytes = generar_pdf_comprobante(
+                    titulo_documento="Acta de Recepción y Movimiento de Almacén",
+                    codigo_documento=cod_doc,
+                    unidad_emisora="Unidad de Almacén, Recepción e Inventario",
+                    datos_generales={
+                        "Tipo Operación": tipo_mov,
+                        "Fecha y Hora": fecha_str,
+                        "Origen / Destino": origen_mov,
+                        "Lote Asignado": lote_mov,
+                        "Ubicación Física": prod_row["ubicacion_bodega"],
+                        "Responsable": user["nombre_completo"]
+                    },
+                    columnas_tabla=["SKU", "Descripción del Rubro", "Medida", "Cantidad", "Saldo Final"],
+                    filas_tabla=[[sku_sel, prod_row["nombre"], prod_row["unidad_medida"], f"{cantidad_mov:,.2f}", f"{nuevo_stock:,.2f}"]],
+                    observaciones=obs_mov or "Verificado peso, integridad de empaque y condiciones de almacenamiento.",
+                    firmas=("Jefe de Almacén e Inventario", "Transportista / Entregado Por", "Contraloría Social")
+                )
+                st.session_state.ultimo_pdf_almacen = pdf_bytes
+                st.session_state.ultimo_cod_almacen = cod_doc
+                st.success(f"Movimiento {cod_doc} registrado correctamente. Nuevo stock: {nuevo_stock:,.2f}")
+
+        if st.session_state.ultimo_pdf_almacen is not None:
+            st.download_button(
+                label="Descargar Acta de Almacén (PDF)",
+                data=st.session_state.ultimo_pdf_almacen,
+                file_name=f"{st.session_state.ultimo_cod_almacen}.pdf",
+                mime="application/pdf",
+                key="btn_descargar_acta_almacen"
+            )
 
     with tab2:
         st.markdown("#### Incorporar Nuevo Rubro al Catálogo Maestro")
@@ -293,21 +314,23 @@ elif modulo_activo == "1. Almacén, Recepción e Inventario":
             n_costo = c6.number_input("Costo Unitario ($)", min_value=0.0, value=15.0)
             n_precio_m = c7.number_input("Precio Mayorista ($)", min_value=0.0, value=20.0)
 
-            if st.form_submit_button("Guardar Nuevo Producto en Catálogo"):
-                if n_sku and n_nombre:
-                    conn = get_connection()
-                    cur = conn.cursor()
-                    try:
-                        cur.execute("""
-                            INSERT INTO inventario (sku, nombre, categoria, unidad_medida, stock_actual, stock_minimo, costo_unitario_usd, precio_detal_usd, precio_mayor_usd)
-                            VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)
-                        """, (n_sku.upper(), n_nombre, n_cat, n_medida, n_min, n_costo, n_precio_m * 1.12, n_precio_m))
-                        conn.commit()
-                        st.success(f"Rubro {n_sku.upper()} creado exitosamente.")
-                    except Exception as e:
-                        st.error(f"Error al crear SKU: {e}")
-                    finally:
-                        conn.close()
+            submitted_sku = st.form_submit_button("Guardar Nuevo Producto en Catálogo")
+
+        if submitted_sku:
+            if n_sku and n_nombre:
+                conn = get_connection()
+                cur = conn.cursor()
+                try:
+                    cur.execute("""
+                        INSERT INTO inventario (sku, nombre, categoria, unidad_medida, stock_actual, stock_minimo, costo_unitario_usd, precio_detal_usd, precio_mayor_usd)
+                        VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)
+                    """, (n_sku.upper(), n_nombre, n_cat, n_medida, n_min, n_costo, n_precio_m * 1.12, n_precio_m))
+                    conn.commit()
+                    st.success(f"Rubro {n_sku.upper()} creado exitosamente.")
+                except Exception as e:
+                    st.error(f"Error al crear SKU: {e}")
+                finally:
+                    conn.close()
 
         st.dataframe(df_inv, use_container_width=True, hide_index=True)
 
@@ -341,7 +364,12 @@ elif modulo_activo == "2. Compras y Acopio Agrícola":
             est_pago = c8.selectbox("Condición Financiera", ["Pendiente por Tesorería", "Pagado Contado", "Cruce por Insumos / Herramientas"])
             obs_comp = st.text_area("Notas de Compra y Calidad del Grano / Insumo")
 
-            if st.form_submit_button("Aprobar Orden de Compra y Generar Comprobante PDF", type="primary"):
+            submitted_compra = st.form_submit_button("Aprobar Orden de Compra y Generar Comprobante PDF", type="primary")
+
+        if submitted_compra:
+            if not proveedor.strip() or not rif_prov.strip():
+                st.error("Debe indicar el nombre del Productor/Proveedor y su Cédula o RIF.")
+            else:
                 sku_c = prod_compra.split(" | ")[0]
                 prod_row = df_inv[df_inv["sku"] == sku_c].iloc[0]
                 total_usd = cant_compra * costo_u
@@ -355,7 +383,6 @@ elif modulo_activo == "2. Compras y Acopio Agrícola":
                     INSERT INTO compras (codigo_compra, fecha, proveedor_productor, cedula_rif, municipio_estado, tipo_adquisicion, sku, cantidad, costo_unitario_usd, total_usd, tasa_bcv, total_bs, estado_pago, observaciones, responsable)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (cod_comp, fecha_str, proveedor, rif_prov, origen_geo, tipo_adq, sku_c, cant_compra, costo_u, total_usd, tasa_bcv_global, total_bs, est_pago, obs_comp, user["username"]))
-                # Actualizar inventario automáticamente al ingresar la compra
                 cur.execute("UPDATE inventario SET stock_actual = stock_actual + ?, costo_unitario_usd = ? WHERE sku = ?", (cant_compra, costo_u, sku_c))
                 conn.commit()
                 conn.close()
@@ -381,8 +408,18 @@ elif modulo_activo == "2. Compras y Acopio Agrícola":
                     observaciones=obs_comp or "Compra aprobada bajo tabla oficial de precios justos al productor.",
                     firmas=("Analista de Compras", "Productor / Proveedor", "Autorizado Finanzas")
                 )
+                st.session_state.ultimo_pdf_compra = pdf_bytes
+                st.session_state.ultimo_cod_compra = cod_comp
                 st.success(f"Orden {cod_comp} registrada por ${total_usd:,.2f} (Bs {total_bs:,.2f}).")
-                st.download_button("Descargar Orden de Compra (PDF)", data=pdf_bytes, file_name=f"{cod_comp}.pdf", mime="application/pdf")
+
+        if st.session_state.ultimo_pdf_compra is not None:
+            st.download_button(
+                label="Descargar Orden de Compra (PDF)",
+                data=st.session_state.ultimo_pdf_compra,
+                file_name=f"{st.session_state.ultimo_cod_compra}.pdf",
+                mime="application/pdf",
+                key="btn_descargar_orden_compra"
+            )
 
     with tab2:
         st.dataframe(query_df("SELECT * FROM compras ORDER BY id DESC"), use_container_width=True, hide_index=True)
@@ -408,7 +445,12 @@ elif modulo_activo == "3. Finanzas, Facturación y Tesorería":
 
             concepto = st.text_input("Concepto Detallado del Movimiento", placeholder="Ej: Cancelación total de pedido de Por Tu Café 100g y 200g")
 
-            if st.form_submit_button("Registrar en Tesorería y Generar Comprobante PDF", type="primary"):
+            submitted_teso = st.form_submit_button("Registrar en Tesorería y Generar Comprobante PDF", type="primary")
+
+        if submitted_teso:
+            if not tercero.strip() or not concepto.strip():
+                st.error("Debe completar el Tercero y el Concepto del movimiento.")
+            else:
                 cod_rec = generar_codigo("REC", "tesoreria")
                 fecha_str = datetime.now().strftime("%Y-%m-%d %H:%M")
                 monto_bs = monto_usd * tasa_bcv_global
@@ -420,7 +462,6 @@ elif modulo_activo == "3. Finanzas, Facturación y Tesorería":
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (cod_rec, fecha_str, tipo_op, concepto, doc_ref, tercero, metodo, referencia, monto_usd, tasa_bcv_global, monto_bs, user["username"]))
 
-                # Si es ingreso vinculado a una venta, actualizar estado de cobro
                 if tipo_op == "Ingreso" and doc_ref.startswith("VTA-"):
                     cur.execute("UPDATE ventas SET estado_cobro = 'Cobrado' WHERE codigo_venta = ?", (doc_ref.strip(),))
                 elif tipo_op == "Egreso" and doc_ref.startswith("COMP-"):
@@ -451,8 +492,18 @@ elif modulo_activo == "3. Finanzas, Facturación y Tesorería":
                     observaciones="Operación conciliada y asentada en los libros auxiliares de la EPSDC Guerreros de la Montaña.",
                     firmas=("Administrador / Tesorero", "Recibido / Conforme", "Contraloría Social")
                 )
+                st.session_state.ultimo_pdf_tesoreria = pdf_bytes
+                st.session_state.ultimo_cod_tesoreria = cod_rec
                 st.success(f"Comprobante {cod_rec} emitido por ${monto_usd:,.2f} (Bs {monto_bs:,.2f}).")
-                st.download_button("Descargar Comprobante Financiero (PDF)", data=pdf_bytes, file_name=f"{cod_rec}.pdf", mime="application/pdf")
+
+        if st.session_state.ultimo_pdf_tesoreria is not None:
+            st.download_button(
+                label="Descargar Comprobante Financiero (PDF)",
+                data=st.session_state.ultimo_pdf_tesoreria,
+                file_name=f"{st.session_state.ultimo_cod_tesoreria}.pdf",
+                mime="application/pdf",
+                key="btn_descargar_comprobante_teso"
+            )
 
     with tab2:
         st.dataframe(query_df("SELECT * FROM tesoreria ORDER BY id DESC"), use_container_width=True, hide_index=True)
@@ -490,7 +541,12 @@ elif modulo_activo == "4. Despacho, Comercialización y Ventas":
             cant_vta = c8.number_input("Cantidad (Bultos / Unidades)", min_value=1.0, value=5.0)
             cond_pago = c9.selectbox("Condición de Pago", ["Contado", "Crédito 7 Días", "Crédito 15 Días", "Trueque / Acopio"])
 
-            if st.form_submit_button("Procesar Pedido, Descontar Stock y Generar Guía PDF", type="primary"):
+            submitted_venta = st.form_submit_button("Procesar Pedido, Descontar Stock y Generar Guía PDF", type="primary")
+
+        if submitted_venta:
+            if not cliente.strip() or not rif_cli.strip():
+                st.error("Debe completar el Nombre del Comercio / Cliente y el RIF o Cédula.")
+            else:
                 sku_v = prod_vta.split(" | ")[0]
                 prod_row = df_inv[df_inv["sku"] == sku_v].iloc[0]
 
@@ -535,8 +591,19 @@ elif modulo_activo == "4. Despacho, Comercialización y Ventas":
                         observaciones=f"Tarifa aplicada: {escala}. Tasa referencial BCV: Bs {tasa_bcv_global:,.2f}/$. Mercancía verificada al salir del Centro de Acopio.",
                         firmas=("Jefe de Despacho y Ventas", "Recibido Conforme (Cliente)", "Control de Salida Almacén")
                     )
+                    st.session_state.ultimo_pdf_venta = pdf_bytes
+                    st.session_state.ultimo_cod_venta = cod_vta
                     st.success(f"Pedido {cod_vta} procesado por ${total_usd:,.2f} (Bs {total_bs:,.2f}).")
-                    st.download_button("Descargar Nota de Entrega / Guía (PDF)", data=pdf_bytes, file_name=f"{cod_vta}.pdf", mime="application/pdf")
+
+        if st.session_state.ultimo_pdf_venta is not None:
+            st.download_button(
+                label="Descargar Nota de Entrega / Guía (PDF)",
+                data=st.session_state.ultimo_pdf_venta,
+                file_name=f"{st.session_state.ultimo_cod_venta}.pdf",
+                mime="application/pdf",
+                key="btn_descargar_guia_venta"
+            )
 
     with tab2:
         st.dataframe(query_df("SELECT * FROM ventas ORDER BY id DESC"), use_container_width=True, hide_index=True)
+Procesados y analizados en código
