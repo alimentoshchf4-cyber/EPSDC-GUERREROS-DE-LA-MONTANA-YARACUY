@@ -10,7 +10,7 @@ from database import init_db, autenticar_usuario, get_connection, query_df, gene
 from pdf_generator import generar_pdf_comprobante
 
 st.set_page_config(
-    page_title="ERP EPSDC Guerreros de la Montaña",
+    page_title="ERP EPSDC Guerreros de la Montaña Yaracuy",
     page_icon="☕",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -38,12 +38,12 @@ def render_logo(logo_path: Path, caption_fallback: str = ""):
 # ==============================================================================
 init_db()
 
-TERRITORIOS_YARACUY = [
+CIRCUITOS_COMERCIALES_YARACUY = [
     "Circuito 01 - Eje Metropolitano",
-    "Zona 02 - Eje Productivo Sur",
-    "Zona 03 - Eje Centro-Occidente",
-    "Zona 04 - Eje Centro-Norte",
-    "Zona 05 - Eje Bolívar / Veroes / Monge",
+    "Circuito 02 - Eje Productivo Sur",
+    "Circuito 03 - Eje Centro-Occidente",
+    "Circuito 04 - Eje Centro-Norte",
+    "Circuiro 05 - Eje Bolívar / Veroes / Monge",
     "Circuito 06 - Eje Costero Morón / Pto. Cabello"
 ]
 
