@@ -38,7 +38,7 @@ def render_logo(logo_path: Path, caption_fallback: str = ""):
 # ==============================================================================
 init_db()
 
-CIRCUITOS_COMERCIALES_YARACUY = [
+TERRITORIOS_YARACUY = [
     "Circuito 01 - Eje Metropolitano",
     "Circuito 02 - Eje Productivo Sur",
     "Circuito 03 - Eje Centro-Occidente",
