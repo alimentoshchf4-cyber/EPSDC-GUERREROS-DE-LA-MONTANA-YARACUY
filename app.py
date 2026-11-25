@@ -39,16 +39,6 @@ st.markdown("""
         font-size: 0.9rem;
         color: #E2E8F0;
     }
-    .kpi-card {
-        background-color: #FFFFFF;
-        border-left: 5px solid #1B4332;
-        padding: 1rem;
-        border-radius: 8px;
-        box-shadow: 0 2px 6px rgba(0,0,0,0.05);
-    }
-    .kpi-card-red {
-        border-left: 5px solid #9B2226;
-    }
     .stButton>button {
         border-radius: 6px;
         font-weight: 600;
@@ -78,8 +68,8 @@ if st.session_state.usuario is None:
         st.markdown("<br>", unsafe_allow_html=True)
         c_logo1, c_title, c_logo2 = st.columns([1, 2.2, 1])
         with c_logo1:
-            if os.path.exists("assets/assets/logo_el_cafetal.jpg"):
-                st.image("assets/assets/logo_el_cafetal.jpg", use_container_width=True)
+            if os.path.exists("assets/logo_el_cafetal.png"):
+                st.image("assets/logo_el_cafetal.png", use_container_width=True)
         with c_title:
             st.markdown(
                 "<h3 style='text-align:center; color:#1B4332; margin-bottom:0;'>EPSDC Guerreros de la Montaña</h3>"
@@ -141,7 +131,6 @@ with st.sidebar:
     tasa_bcv_global = st.number_input("Tasa Oficial BCV del Día (Bs/$)", min_value=1.0, value=46.50, step=0.10)
     st.markdown("---")
 
-    # Menú dinámico según permisos de unidad (Gerencia tiene acceso total)
     opciones_menu = ["Panel Ejecutivo y Contraloría"]
     if rol in ["ADMIN", "ALMACEN"]:
         opciones_menu.append("1. Almacén, Recepción e Inventario")
@@ -606,4 +595,3 @@ elif modulo_activo == "4. Despacho, Comercialización y Ventas":
 
     with tab2:
         st.dataframe(query_df("SELECT * FROM ventas ORDER BY id DESC"), use_container_width=True, hide_index=True)
-Procesados y analizados en código
