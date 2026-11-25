@@ -20,8 +20,8 @@ st.set_page_config(
 # CONFIGURACIÓN DE ACTIVOS Y MARCAS
 # ==============================================================================
 BASE_DIR = Path(__file__).resolve().parent
-LOGO_CAFETAL_PATH = BASE_DIR / "assets" / "logo_el_cafetal.png"
-LOGO_PORTU_PATH = BASE_DIR / "assets" / "logo_por_tu_cafe.png"
+LOGO_CAFETAL_PATH = BASE_DIR / "assets" / "logo_el_cafetal.jpg"
+LOGO_PORTU_PATH = BASE_DIR / "assets" / "logo_portu_cafe.jpg"
 
 
 def render_logo(logo_path: Path, caption_fallback: str = ""):
