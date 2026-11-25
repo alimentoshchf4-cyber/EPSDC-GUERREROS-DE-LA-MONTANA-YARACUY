@@ -1,6 +1,6 @@
 import os
 import io
-from datetime import datetime
+from datetime import datetime, timedelta
 import streamlit as st
 import pandas as pd
 
@@ -16,6 +16,81 @@ st.set_page_config(
 
 # Inicializar Base de Datos
 init_db()
+
+
+def asegurar_tabla_tasa_bcv():
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS configuracion_tasa_bcv (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        tasa_bcv REAL NOT NULL,
+        actualizada_en TEXT NOT NULL,
+        expira_en TEXT NOT NULL,
+        modificada_por TEXT NOT NULL
+    )
+    """)
+    cur.execute("SELECT COUNT(*) FROM configuracion_tasa_bcv WHERE id = 1")
+    if cur.fetchone()[0] == 0:
+        ahora = datetime.now()
+        expira = ahora + timedelta(hours=24)
+        cur.execute(
+            """
+            INSERT INTO configuracion_tasa_bcv (id, tasa_bcv, actualizada_en, expira_en, modificada_por)
+            VALUES (1, ?, ?, ?, ?)
+            """,
+            (46.50, ahora.strftime("%Y-%m-%d %H:%M:%S"), expira.strftime("%Y-%m-%d %H:%M:%S"), "gerencia")
+        )
+        conn.commit()
+    conn.close()
+
+
+def obtener_estado_tasa_bcv() -> dict:
+    asegurar_tabla_tasa_bcv()
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT tasa_bcv, actualizada_en, expira_en, modificada_por FROM configuracion_tasa_bcv WHERE id = 1")
+    row = cur.fetchone()
+    conn.close()
+
+    tasa = float(row["tasa_bcv"])
+    actualizada_dt = datetime.strptime(row["actualizada_en"], "%Y-%m-%d %H:%M:%S")
+    expira_dt = datetime.strptime(row["expira_en"], "%Y-%m-%d %H:%M:%S")
+    ahora = datetime.now()
+    vigente = ahora < expira_dt
+    restante = max(expira_dt - ahora, timedelta(0))
+    horas_restantes = int(restante.total_seconds() // 3600)
+    minutos_restantes = int((restante.total_seconds() % 3600) // 60)
+
+    return {
+        "tasa_bcv": tasa,
+        "actualizada_en": actualizada_dt.strftime("%d/%m/%Y %H:%M:%S"),
+        "expira_en": expira_dt.strftime("%d/%m/%Y %H:%M:%S"),
+        "modificada_por": row["modificada_por"],
+        "vigente": vigente,
+        "tiempo_restante": f"{horas_restantes}h {minutos_restantes}m"
+    }
+
+
+def guardar_tasa_bcv_administrador(nueva_tasa: float, usuario_admin: str):
+    asegurar_tabla_tasa_bcv()
+    ahora = datetime.now()
+    expira = ahora + timedelta(hours=24)
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE configuracion_tasa_bcv
+        SET tasa_bcv = ?, actualizada_en = ?, expira_en = ?, modificada_por = ?
+        WHERE id = 1
+        """,
+        (float(nueva_tasa), ahora.strftime("%Y-%m-%d %H:%M:%S"), expira.strftime("%Y-%m-%d %H:%M:%S"), usuario_admin)
+    )
+    conn.commit()
+    conn.close()
+
+
+asegurar_tabla_tasa_bcv()
 
 # Estilos Corporativos CSS
 st.markdown("""
@@ -68,8 +143,8 @@ if st.session_state.usuario is None:
         st.markdown("<br>", unsafe_allow_html=True)
         c_logo1, c_title, c_logo2 = st.columns([1, 2.2, 1])
         with c_logo1:
-            if os.path.exists("assets/logo_el_cafetal.jpg"):
-                st.image("assets/logo_el_cafetal.jpg", use_container_width=True)
+            if os.path.exists("assets/logo_el_cafetal.png"):
+                st.image("assets/logo_el_cafetal.png", use_container_width=True)
         with c_title:
             st.markdown(
                 "<h3 style='text-align:center; color:#1B4332; margin-bottom:0;'>EPSDC Guerreros de la Montaña</h3>"
@@ -77,8 +152,8 @@ if st.session_state.usuario is None:
                 unsafe_allow_html=True
             )
         with c_logo2:
-            if os.path.exists("assets/logo_por_tu_cafe.jpg"):
-                st.image("assets/logo_por_tu_cafe.jpg", use_container_width=True)
+            if os.path.exists("assets/logo_por_tu_cafe.png"):
+                st.image("assets/logo_por_tu_cafe.png", use_container_width=True)
 
         st.markdown("---")
         st.subheader("Acceso al Sistema Administrativo y Control de Gestión")
@@ -99,7 +174,7 @@ if st.session_state.usuario is None:
 
         with st.expander("Ver Claves de Acceso de Prueba por Unidad"):
             st.markdown("""
-            * **Gerencia / Contraloría Social:** `gerencia` | `Admin2026*`
+            * **Gerencia / Contraloría Social (Administrador):** `gerencia` | `Admin2026*`
             * **Unidad de Almacén e Inventario:** `almacen` | `Almacen2026*`
             * **Unidad de Compras y Abastecimiento:** `compras` | `Compras2026*`
             * **Unidad Financiera y Tesorería:** `finanzas` | `Finanzas2026*`
@@ -112,6 +187,10 @@ if st.session_state.usuario is None:
 # ==============================================================================
 user = st.session_state.usuario
 rol = user["rol"]
+es_admin = (rol == "ADMIN")
+
+estado_tasa = obtener_estado_tasa_bcv()
+tasa_bcv_global = estado_tasa["tasa_bcv"]
 
 # Barra Lateral Corporativa
 with st.sidebar:
@@ -128,7 +207,31 @@ with st.sidebar:
     st.markdown(f"**Cargo:** {user['cargo']}")
     st.markdown("---")
 
-    tasa_bcv_global = st.number_input("Tasa Oficial BCV del Día (Bs/$)", min_value=1.0, value=46.50, step=0.10)
+    st.markdown("### Tasa Oficial BCV (Bloqueada 24h)")
+    st.metric("Tasa BCV Vigente (Bs/$)", f"Bs {tasa_bcv_global:,.2f}")
+    st.caption(f"Fijada: {estado_tasa['actualizada_en']} por `{estado_tasa['modificada_por']}`")
+    if estado_tasa["vigente"]:
+        st.caption(f"Vigencia activa: vence en {estado_tasa['tiempo_restante']} ({estado_tasa['expira_en']})")
+    else:
+        st.warning(f"Ciclo de 24h vencido el {estado_tasa['expira_en']}. Requiere actualización del Administrador.")
+
+    if es_admin:
+        with st.form("form_tasa_bcv_admin"):
+            nueva_tasa_bcv = st.number_input(
+                "Actualizar Tasa BCV (Vigencia 24 Horas)",
+                min_value=1.0,
+                value=float(tasa_bcv_global),
+                step=0.10,
+                format="%.2f"
+            )
+            guardar_tasa = st.form_submit_button("Fijar Tasa por 24 Horas", use_container_width=True, type="primary")
+            if guardar_tasa:
+                guardar_tasa_bcv_administrador(nueva_tasa_bcv, user["username"])
+                st.success(f"Tasa BCV actualizada a Bs {nueva_tasa_bcv:,.2f} por 24 horas.")
+                st.rerun()
+    else:
+        st.info("Solo el Administrador puede modificar la tasa BCV (vigencia de 24 horas).")
+
     st.markdown("---")
 
     opciones_menu = ["Panel Ejecutivo y Contraloría"]
@@ -155,6 +258,12 @@ st.markdown(f"""
     <p>RIF: J-507789474 | Centro de Acopio y Distribución • Marca Comercial: <b>Por Tu Café</b> & Aliados <b>El Cafetal</b></p>
 </div>
 """, unsafe_allow_html=True)
+
+if not estado_tasa["vigente"]:
+    st.error(
+        f"La tasa BCV registrada (Bs {tasa_bcv_global:,.2f}/$) cumplió su ventana de 24 horas el {estado_tasa['expira_en']}. "
+        "Solicite al usuario Administrador (`gerencia`) actualizarla antes de emitir nuevos comprobantes."
+    )
 
 # ==============================================================================
 # MÓDULO 0: PANEL EJECUTIVO Y CONTRALORÍA SOCIAL
