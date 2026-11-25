@@ -9,7 +9,7 @@ from database import init_db, autenticar_usuario, get_connection, query_df, gene
 from pdf_generator import generar_pdf_comprobante
 
 st.set_page_config(
-    page_title="ERP EPSDC Guerreros de la Montaña",
+    page_title="ERP EPSDC Guerreros de la Montaña Yaracuy",
     page_icon="☕",
     layout="wide",
     initial_sidebar_state="expanded"
