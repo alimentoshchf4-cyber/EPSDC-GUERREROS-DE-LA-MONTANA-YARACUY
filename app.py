@@ -1,3 +1,4 @@
+
 import os
 import io
 import re
@@ -20,8 +21,8 @@ st.set_page_config(
 # CONFIGURACIÓN DE ACTIVOS Y MARCAS
 # ==============================================================================
 BASE_DIR = Path(__file__).resolve().parent
-LOGO_CAFETAL_PATH = BASE_DIR / "assets" / "logo_el_cafetal.jpg"
-LOGO_PORTU_PATH = BASE_DIR / "assets" / "logo_portu_cafe.jpg"
+LOGO_CAFETAL_PATH = BASE_DIR / "assets" / "logo_el_cafetal.png"
+LOGO_PORTU_PATH = BASE_DIR / "assets" / "logo_por_tu_cafe.png"
 
 
 def render_logo(logo_path: Path, caption_fallback: str = ""):
@@ -741,6 +742,23 @@ def asegurar_esquema_finanzas_robusto():
     """)
 
     cur.execute("""
+    CREATE TABLE IF NOT EXISTS factura_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        numero_factura TEXT NOT NULL,
+        sku TEXT NOT NULL,
+        descripcion TEXT NOT NULL,
+        cantidad REAL NOT NULL,
+        precio_unitario_usd REAL NOT NULL,
+        costo_unitario_usd REAL NOT NULL,
+        descuento_pct REAL NOT NULL DEFAULT 0.0,
+        impuesto_pct REAL NOT NULL DEFAULT 0.0,
+        subtotal_usd REAL NOT NULL,
+        impuesto_usd REAL NOT NULL,
+        total_usd REAL NOT NULL
+    )
+    """)
+
+    cur.execute("""
     CREATE TABLE IF NOT EXISTS movimientos_cxc (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         numero_factura TEXT NOT NULL,
@@ -953,6 +971,195 @@ def emitir_factura_atomica(
         conn.commit()
         registrar_auditoria_comercial(user_ctx, "Finanzas", "EMITIR_FACTURA", num_fac, f"Total ${total_usd:,.2f} | Estado {estado_doc}")
         return {"numero_factura": num_fac, "total_usd": total_usd, "total_bs": total_bs, "estado": estado_doc}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def emitir_factura_multisku_atomica(
+    doc_origen: str,
+    cliente_codigo: str,
+    cliente_nombre: str,
+    rif_cliente: str,
+    fecha_emision_str: str,
+    fecha_vencimiento_str: str,
+    moneda: str,
+    tasa_bcv: float,
+    items: list,
+    condicion_pago: str,
+    responsable: str,
+    user_ctx: dict
+) -> dict:
+    if not items:
+        raise ValueError("Debe agregar al menos un SKU o producto a la factura.")
+
+    tasa_d = a_decimal(tasa_bcv, "1.00")
+    lineas_calc = []
+    sub_tot = Decimal("0.00")
+    imp_tot = Decimal("0.00")
+    tot_usd = Decimal("0.00")
+
+    for it in items:
+        cant_d = a_decimal(it["cantidad"])
+        precio_d = a_decimal(it["precio_unitario_usd"])
+        costo_d = a_decimal(it.get("costo_unitario_usd", "0.00"))
+        desc_d = a_decimal(it.get("descuento_pct", "0.00"))
+        imp_d = a_decimal(it.get("impuesto_pct", "0.00"))
+
+        if cant_d <= Decimal("0.00") or precio_d <= Decimal("0.00"):
+            raise ValueError(f"Cantidad y precio unitario deben ser mayores a cero en SKU {it.get('sku', '')}.")
+
+        subtotal_bruto = redondear_moneda(cant_d * precio_d)
+        descuento_usd = redondear_moneda(subtotal_bruto * (desc_d / Decimal("100")))
+        base_imp = max(Decimal("0.00"), redondear_moneda(subtotal_bruto - descuento_usd))
+        imp_linea = redondear_moneda(base_imp * (imp_d / Decimal("100")))
+        tot_linea = redondear_moneda(base_imp + imp_linea)
+
+        sub_tot = redondear_moneda(sub_tot + base_imp)
+        imp_tot = redondear_moneda(imp_tot + imp_linea)
+        tot_usd = redondear_moneda(tot_usd + tot_linea)
+
+        lineas_calc.append({
+            "sku": str(it["sku"]).strip(),
+            "descripcion": str(it["descripcion"]).strip(),
+            "cantidad": cant_d,
+            "precio_unitario_usd": precio_d,
+            "costo_unitario_usd": costo_d,
+            "descuento_pct": desc_d,
+            "impuesto_pct": imp_d,
+            "subtotal_usd": base_imp,
+            "impuesto_usd": imp_linea,
+            "total_usd": tot_linea,
+        })
+
+    total_bs = redondear_moneda(tot_usd * tasa_d)
+    es_contado = (condicion_pago == "Contado")
+    cobrado_ini = tot_usd if es_contado else Decimal("0.00")
+    saldo_ini = Decimal("0.00") if es_contado else tot_usd
+    estado_doc = "PAGADA" if es_contado else "EMITIDA"
+
+    if len(lineas_calc) == 1:
+        sku_resumen = lineas_calc[0]["sku"]
+        desc_resumen = lineas_calc[0]["descripcion"]
+        cant_resumen = float(lineas_calc[0]["cantidad"])
+        precio_resumen = float(lineas_calc[0]["precio_unitario_usd"])
+        costo_resumen = float(lineas_calc[0]["costo_unitario_usd"])
+        desc_pct_resumen = float(lineas_calc[0]["descuento_pct"])
+        imp_pct_resumen = float(lineas_calc[0]["impuesto_pct"])
+    else:
+        sku_resumen = "MULTI-SKU"
+        desc_resumen = f"Factura multi-SKU ({len(lineas_calc)} ítems): " + ", ".join(
+            f"{l['sku']} x{l['cantidad']:g}" for l in lineas_calc[:4]
+        ) + ("..." if len(lineas_calc) > 4 else "")
+        cant_resumen = float(sum((l["cantidad"] for l in lineas_calc), Decimal("0.00")))
+        precio_resumen = float(redondear_moneda(sub_tot / a_decimal(cant_resumen, "1.00"))) if cant_resumen > 0 else 0.0
+        costo_tot_all = sum((l["cantidad"] * l["costo_unitario_usd"] for l in lineas_calc), Decimal("0.00"))
+        costo_resumen = float(redondear_moneda(costo_tot_all / a_decimal(cant_resumen, "1.00"))) if cant_resumen > 0 else 0.0
+        desc_pct_resumen = 0.0
+        imp_pct_resumen = float(redondear_moneda((imp_tot / sub_tot) * Decimal("100"))) if sub_tot > Decimal("0.00") else 0.0
+
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        num_fac = generar_codigo("FAC", "facturas_emitidas")
+
+        cur.execute(
+            """
+            INSERT INTO facturas_emitidas
+            (numero_factura, doc_origen, cliente_codigo, cliente_nombre, rif_cliente,
+             fecha_emision, fecha_vencimiento, moneda, tasa_cambio, sku, descripcion,
+             cantidad, precio_unitario_usd, costo_unitario_usd, descuento_pct, impuesto_pct,
+             subtotal_usd, impuesto_usd, total_usd, total_bs, monto_cobrado_usd,
+             saldo_pendiente_usd, estado_documento, motivo_estado, responsable)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?)
+            """,
+            (
+                num_fac, doc_origen.strip(), cliente_codigo.strip(), cliente_nombre.strip(),
+                rif_cliente.strip(), fecha_emision_str, fecha_vencimiento_str, moneda,
+                float(tasa_d), sku_resumen, desc_resumen[:240], cant_resumen, precio_resumen,
+                costo_resumen, desc_pct_resumen, imp_pct_resumen, float(sub_tot), float(imp_tot),
+                float(tot_usd), float(total_bs), float(cobrado_ini), float(saldo_ini),
+                estado_doc, responsable
+            )
+        )
+
+        for l in lineas_calc:
+            cur.execute(
+                """
+                INSERT INTO factura_items
+                (numero_factura, sku, descripcion, cantidad, precio_unitario_usd,
+                 costo_unitario_usd, descuento_pct, impuesto_pct, subtotal_usd,
+                 impuesto_usd, total_usd)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    num_fac, l["sku"], l["descripcion"], float(l["cantidad"]),
+                    float(l["precio_unitario_usd"]), float(l["costo_unitario_usd"]),
+                    float(l["descuento_pct"]), float(l["impuesto_pct"]),
+                    float(l["subtotal_usd"]), float(l["impuesto_usd"]), float(l["total_usd"])
+                )
+            )
+
+        if saldo_ini > Decimal("0.00"):
+            cur.execute(
+                """
+                INSERT INTO movimientos_cxc
+                (numero_factura, cliente_codigo, cliente_nombre, fecha_movimiento,
+                 tipo_movimiento, monto_usd, monto_bs, referencia, responsable)
+                VALUES (?, ?, ?, ?, 'CARGO_FACTURA', ?, ?, ?, ?)
+                """,
+                (
+                    num_fac, cliente_codigo.strip(), cliente_nombre.strip(),
+                    fecha_emision_str, float(saldo_ini), float(redondear_moneda(saldo_ini * tasa_d)),
+                    doc_origen.strip() or num_fac, responsable
+                )
+            )
+            cur.execute(
+                """
+                UPDATE clientes_cartera
+                SET saldo_pendiente_usd = ROUND(saldo_pendiente_usd + ?, 2),
+                    fecha_ultima_compra = ?
+                WHERE codigo_cliente = ?
+                """,
+                (float(saldo_ini), fecha_emision_str[:10], cliente_codigo.strip())
+            )
+        elif es_contado:
+            cod_rec = generar_codigo("REC", "tesoreria")
+            cur.execute(
+                """
+                INSERT INTO tesoreria
+                (codigo_recibo, fecha, tipo_operacion, concepto, doc_asociado, tercero,
+                 metodo_pago, referencia, monto_usd, tasa_bcv, monto_bs, responsable)
+                VALUES (?, ?, 'Ingreso', ?, ?, ?, 'Contado / Facturación', ?, ?, ?, ?, ?)
+                """,
+                (
+                    cod_rec, fecha_emision_str, f"Cobro contado factura {num_fac} ({len(lineas_calc)} SKUs)",
+                    num_fac, cliente_nombre.strip(), num_fac, float(tot_usd),
+                    float(tasa_d), float(total_bs), responsable
+                )
+            )
+            cur.execute(
+                "UPDATE cuentas_tesoreria SET saldo_actual = ROUND(saldo_actual + ?, 2) WHERE codigo_cuenta = 'CTA-CAJA-USD'",
+                (float(tot_usd),)
+            )
+
+        conn.commit()
+        registrar_auditoria_comercial(
+            user_ctx, "Finanzas", "EMITIR_FACTURA_MULTISKU", num_fac,
+            f"{len(lineas_calc)} SKUs | Subtotal ${sub_tot:,.2f} | Imp ${imp_tot:,.2f} | Total ${tot_usd:,.2f} | {estado_doc}"
+        )
+        return {
+            "numero_factura": num_fac,
+            "subtotal_usd": sub_tot,
+            "impuesto_usd": imp_tot,
+            "total_usd": tot_usd,
+            "total_bs": total_bs,
+            "estado": estado_doc,
+            "lineas": lineas_calc
+        }
     except Exception:
         conn.rollback()
         raise
@@ -1963,40 +2170,121 @@ elif modulo_activo == "3. Finanzas, Facturación y Tesorería":
     # 1. FACTURACIÓN Y CONTROL DE INGRESOS
     # --------------------------------------------------------------------------
     with t_fac:
-        st.markdown("### 1. Emisión Trazable de Facturas y Estados de Documento")
-        st.caption("Vincula preventas/órdenes aprobadas o emisiones directas, calcula impuestos/descuentos con Decimal y gestiona estados EMITIDA / PARCIAL / PAGADA / ANULADA / NOTA_CREDITO.")
+        st.markdown("### 1. Emisión Trazable de Facturas y Estados de Documento (Multi-SKU)")
+        st.caption("Agregue uno o varios SKUs a una misma factura, calcule subtotales, descuentos e impuestos con Decimal y emita el comprobante consolidado.")
 
-        with st.form("form_emitir_factura_f"):
-            c1, c2, c3 = st.columns(3)
-            prev_opts = ["Emisión Directa (Sin Preventa)"]
-            if not df_prev_f.empty:
-                prev_opts += (
-                    df_prev_f["codigo_preventa"] + " | " + df_prev_f["cliente_nombre"] +
-                    " | " + df_prev_f["sku"] + " (" + df_prev_f["estado_preventa"] + ")"
-                ).tolist()
-            origen_sel = c1.selectbox("Preventa / Orden Vinculada", prev_opts)
+        if "carrito_factura_items" not in st.session_state:
+            st.session_state.carrito_factura_items = []
 
-            cli_opts_f = []
-            if not df_cli_f.empty:
-                cli_opts_f = (df_cli_f["codigo_cliente"] + " | " + df_cli_f["nombre_comercio"] + " [" + df_cli_f["rif_cedula"] + "]").tolist()
-            cli_fac_sel = c2.selectbox("Cliente Receptor", cli_opts_f if cli_opts_f else ["CLI-GEN | Cliente General [V-00000000]"])
-            cond_fac = c3.selectbox("Condición de Pago", ["Contado", "Crédito 7 Días", "Crédito 15 Días", "Crédito 30 Días"])
+        # Encabezado general de la factura
+        h1, h2, h3 = st.columns(3)
+        prev_opts = ["Emisión Directa (Sin Preventa)"]
+        if not df_prev_f.empty:
+            prev_opts += (
+                df_prev_f["codigo_preventa"] + " | " + df_prev_f["cliente_nombre"] +
+                " | " + df_prev_f["sku"] + " (" + df_prev_f["estado_preventa"] + ")"
+            ).tolist()
+        origen_sel = h1.selectbox("Preventa / Orden Vinculada", prev_opts, key="fac_hdr_prev")
 
-            c4, c5, c6, c7 = st.columns(4)
-            f_emision = c4.date_input("Fecha de Emisión", value=datetime.now().date())
-            f_venc = c5.date_input("Fecha de Vencimiento", value=(datetime.now() + timedelta(days=7)).date())
-            moneda_fac = c6.selectbox("Moneda de Factura", ["USD", "VES"])
-            escala_fac = c7.selectbox("Escala de Precio", ["Mayorista", "Detal / Bodega"])
+        cli_opts_f = []
+        if not df_cli_f.empty:
+            cli_opts_f = (df_cli_f["codigo_cliente"] + " | " + df_cli_f["nombre_comercio"] + " [" + df_cli_f["rif_cedula"] + "]").tolist()
+        cli_fac_sel = h2.selectbox("Cliente Receptor", cli_opts_f if cli_opts_f else ["CLI-GEN | Cliente General [V-00000000]"], key="fac_hdr_cli")
+        cond_fac = h3.selectbox("Condición de Pago", ["Contado", "Crédito 7 Días", "Crédito 15 Días", "Crédito 30 Días"], key="fac_hdr_cond")
 
-            c8, c9, c10, c11 = st.columns(4)
-            prod_fac_sel = c8.selectbox("SKU / Ítem", df_inv_f["sku"] + " | " + df_inv_f["nombre"])
-            cant_fac = c9.number_input("Cantidad", min_value=0.01, value=5.0, step=1.0, key="fac_cant")
-            desc_fac = c10.number_input("Descuento (%)", min_value=0.0, max_value=50.0, value=0.0, step=1.0, key="fac_desc")
-            imp_fac = c11.number_input("Impuesto / IVA (%)", min_value=0.0, max_value=30.0, value=16.0, step=1.0, key="fac_imp")
+        h4, h5, h6, h7 = st.columns(4)
+        f_emision = h4.date_input("Fecha de Emisión", value=datetime.now().date(), key="fac_hdr_fe")
+        f_venc = h5.date_input("Fecha de Vencimiento", value=(datetime.now() + timedelta(days=7)).date(), key="fac_hdr_fv")
+        moneda_fac = h6.selectbox("Moneda de Factura", ["USD", "VES"], key="fac_hdr_mon")
+        escala_fac = h7.selectbox("Escala de Precio Base", ["Mayorista", "Detal / Bodega"], key="fac_hdr_esc")
 
-            btn_emit_fac = st.form_submit_button("Emitir Factura (Transacción Atómica)", type="primary")
+        st.markdown("#### Agregar SKU / Producto al Detalle de la Factura")
+        with st.form("form_agregar_item_factura"):
+            a1, a2, a3, a4, a5 = st.columns([2.4, 1.0, 1.0, 1.0, 1.0])
+            prod_fac_sel = a1.selectbox(
+                "SKU / Producto",
+                df_inv_f["sku"] + " | " + df_inv_f["nombre"] + " (Stock: " + df_inv_f["stock_actual"].astype(str) + ")",
+                key="fac_item_sku"
+            )
+            cant_fac = a2.number_input("Cantidad", min_value=0.01, value=5.0, step=1.0, key="fac_cant")
+            desc_fac = a3.number_input("Descuento (%)", min_value=0.0, max_value=50.0, value=0.0, step=1.0, key="fac_desc")
+            imp_fac = a4.number_input("IVA / Imp. (%)", min_value=0.0, max_value=30.0, value=16.0, step=1.0, key="fac_imp")
+            precio_custom_fac = a5.number_input("Precio Unit. $ (0=Auto)", min_value=0.0, value=0.0, step=0.50, key="fac_precio_custom")
 
-        if btn_emit_fac:
+            btn_add_item = st.form_submit_button("Agregar SKU a la Factura", use_container_width=True)
+
+        if btn_add_item:
+            sku_f = prod_fac_sel.split(" | ")[0]
+            prow = df_inv_f[df_inv_f["sku"] == sku_f].iloc[0]
+            if precio_custom_fac > 0:
+                precio_u_f = redondear_moneda(a_decimal(precio_custom_fac))
+            else:
+                precio_u_f = a_decimal(prow["precio_mayor_usd"] if escala_fac == "Mayorista" else prow["precio_detal_usd"])
+                if precio_u_f <= Decimal("0.00"):
+                    precio_u_f = redondear_moneda(a_decimal(prow["costo_unitario_usd"]) * Decimal("1.25"))
+
+            cant_d = a_decimal(cant_fac)
+            desc_d = a_decimal(desc_fac)
+            imp_d = a_decimal(imp_fac)
+            sub_bruto = redondear_moneda(cant_d * precio_u_f)
+            desc_usd = redondear_moneda(sub_bruto * (desc_d / Decimal("100")))
+            base_imp = max(Decimal("0.00"), redondear_moneda(sub_bruto - desc_usd))
+            imp_usd = redondear_moneda(base_imp * (imp_d / Decimal("100")))
+            tot_lin = redondear_moneda(base_imp + imp_usd)
+
+            st.session_state.carrito_factura_items.append({
+                "sku": sku_f,
+                "descripcion": str(prow["nombre"]),
+                "cantidad": float(cant_d),
+                "precio_unitario_usd": float(precio_u_f),
+                "costo_unitario_usd": float(a_decimal(prow["costo_unitario_usd"])),
+                "descuento_pct": float(desc_d),
+                "impuesto_pct": float(imp_d),
+                "subtotal_usd": float(base_imp),
+                "impuesto_usd": float(imp_usd),
+                "total_usd": float(tot_lin),
+            })
+            st.success(f"Agregado `{sku_f}` ({cant_d:g} und. a ${precio_u_f:,.2f}) al detalle de la factura.")
+            st.rerun()
+
+        # Vista del detalle multi-SKU actual
+        if st.session_state.carrito_factura_items:
+            df_cart_fac = pd.DataFrame(st.session_state.carrito_factura_items)
+            st.markdown("##### Ítems Cargados en la Factura Actual")
+            st.dataframe(
+                df_cart_fac[["sku", "descripcion", "cantidad", "precio_unitario_usd", "descuento_pct", "impuesto_pct", "subtotal_usd", "impuesto_usd", "total_usd"]],
+                use_container_width=True,
+                hide_index=True
+            )
+
+            sub_ac = redondear_moneda(sum((a_decimal(x["subtotal_usd"]) for x in st.session_state.carrito_factura_items), Decimal("0.00")))
+            imp_ac = redondear_moneda(sum((a_decimal(x["impuesto_usd"]) for x in st.session_state.carrito_factura_items), Decimal("0.00")))
+            tot_ac = redondear_moneda(sum((a_decimal(x["total_usd"]) for x in st.session_state.carrito_factura_items), Decimal("0.00")))
+            tot_bs_ac = redondear_moneda(tot_ac * a_decimal(tasa_bcv_global, "1.00"))
+
+            m_f1, m_f2, m_f3, m_f4 = st.columns(4)
+            m_f1.metric("SKUs en Factura", f"{len(st.session_state.carrito_factura_items)}")
+            m_f2.metric("Subtotal Neto ($)", f"${sub_ac:,.2f}")
+            m_f3.metric("Total Impuestos ($)", f"${imp_ac:,.2f}")
+            m_f4.metric("Total Factura", f"${tot_ac:,.2f}", f"Bs {tot_bs_ac:,.2f}")
+
+            c_act1, c_act2, c_act3 = st.columns([2, 1, 1])
+            idx_quitar = c_act1.selectbox(
+                "Quitar Línea Específica",
+                [f"#{i+1} - {it['sku']} ({it['descripcion']} | Cant: {it['cantidad']})" for i, it in enumerate(st.session_state.carrito_factura_items)],
+                key="fac_quitar_sel"
+            )
+            if c_act2.button("Quitar Ítem", use_container_width=True):
+                pos_rm = int(idx_quitar.split("#")[1].split(" - ")[0]) - 1
+                st.session_state.carrito_factura_items.pop(pos_rm)
+                st.rerun()
+            if c_act3.button("Vaciar Ítems", use_container_width=True):
+                st.session_state.carrito_factura_items = []
+                st.rerun()
+        else:
+            st.info("Aún no ha agregado SKUs al carrito de la factura. Puede agregar varios productos arriba o emitir directamente con los valores actuales.")
+
+        if st.button("Emitir Factura Multi-SKU (Transacción Atómica)", type="primary", use_container_width=True):
             try:
                 doc_orig_txt = "" if origen_sel.startswith("Emisión Directa") else origen_sel.split(" | ")[0]
                 cli_cod_txt = cli_fac_sel.split(" | ")[0]
@@ -2008,13 +2296,24 @@ elif modulo_activo == "3. Finanzas, Facturación y Tesorería":
                     cli_nom_txt = cli_fac_sel.split(" | ")[1].split(" [")[0] if " | " in cli_fac_sel else "Cliente General"
                     rif_txt = "V-00000000"
 
-                sku_f = prod_fac_sel.split(" | ")[0]
-                prow = df_inv_f[df_inv_f["sku"] == sku_f].iloc[0]
-                precio_u_f = a_decimal(prow["precio_mayor_usd"] if escala_fac == "Mayorista" else prow["precio_detal_usd"])
-                if precio_u_f <= Decimal("0.00"):
-                    precio_u_f = redondear_moneda(a_decimal(prow["costo_unitario_usd"]) * Decimal("1.25"))
+                items_a_facturar = list(st.session_state.carrito_factura_items)
+                if not items_a_facturar:
+                    sku_f = prod_fac_sel.split(" | ")[0]
+                    prow = df_inv_f[df_inv_f["sku"] == sku_f].iloc[0]
+                    precio_u_f = a_decimal(prow["precio_mayor_usd"] if escala_fac == "Mayorista" else prow["precio_detal_usd"])
+                    if precio_u_f <= Decimal("0.00"):
+                        precio_u_f = redondear_moneda(a_decimal(prow["costo_unitario_usd"]) * Decimal("1.25"))
+                    items_a_facturar = [{
+                        "sku": sku_f,
+                        "descripcion": str(prow["nombre"]),
+                        "cantidad": float(cant_fac),
+                        "precio_unitario_usd": float(precio_u_f),
+                        "costo_unitario_usd": float(a_decimal(prow["costo_unitario_usd"])),
+                        "descuento_pct": float(desc_fac),
+                        "impuesto_pct": float(imp_fac),
+                    }]
 
-                res_fac = emitir_factura_atomica(
+                res_fac = emitir_factura_multisku_atomica(
                     doc_origen=doc_orig_txt,
                     cliente_codigo=cli_cod_txt,
                     cliente_nombre=cli_nom_txt,
@@ -2023,24 +2322,69 @@ elif modulo_activo == "3. Finanzas, Facturación y Tesorería":
                     fecha_vencimiento_str=f_venc.strftime("%Y-%m-%d"),
                     moneda=moneda_fac,
                     tasa_bcv=tasa_bcv_global,
-                    sku=sku_f,
-                    descripcion=prow["nombre"],
-                    cantidad=cant_fac,
-                    precio_unitario_usd=precio_u_f,
-                    costo_unitario_usd=prow["costo_unitario_usd"],
-                    descuento_pct=desc_fac,
-                    impuesto_pct=imp_fac,
+                    items=items_a_facturar,
                     condicion_pago=cond_fac,
                     responsable=user["username"],
                     user_ctx=user
                 )
-                st.success(f"Factura `{res_fac['numero_factura']}` emitida por ${res_fac['total_usd']:,.2f} (Bs {res_fac['total_bs']:,.2f}) — Estado: `{res_fac['estado']}`.")
+
+                filas_pdf_fac = []
+                for l in res_fac["lineas"]:
+                    filas_pdf_fac.append([
+                        l["sku"],
+                        l["descripcion"][:34],
+                        f"{l['cantidad']:,.2f}",
+                        f"${l['precio_unitario_usd']:,.2f}",
+                        f"${l['total_usd']:,.2f}"
+                    ])
+
+                pdf_fac_bytes = generar_pdf_comprobante(
+                    titulo_documento="Factura Comercial Multi-SKU",
+                    codigo_documento=res_fac["numero_factura"],
+                    unidad_emisora="Unidad Financiera y Facturación",
+                    datos_generales={
+                        "Cliente": f"{cli_cod_txt} - {cli_nom_txt}",
+                        "RIF": rif_txt,
+                        "Emisión / Venc.": f"{f_emision.strftime('%Y-%m-%d')} / {f_venc.strftime('%Y-%m-%d')}",
+                        "Condición / Estado": f"{cond_fac} ({res_fac['estado']})",
+                        "Tasa BCV": f"Bs {a_decimal(tasa_bcv_global):,.2f} / $",
+                        "Doc. Origen": doc_orig_txt or "Directa"
+                    },
+                    columnas_tabla=["SKU", "Descripción", "Cant.", "P. Unit ($)", "Total ($)"],
+                    filas_tabla=filas_pdf_fac,
+                    totales={
+                        "SUBTOTAL NETO ($):": f"${res_fac['subtotal_usd']:,.2f}",
+                        "IMPUESTOS ($):": f"${res_fac['impuesto_usd']:,.2f}",
+                        "TOTAL FACTURA ($):": f"${res_fac['total_usd']:,.2f}",
+                        "EQUIVALENTE (Bs):": f"Bs {res_fac['total_bs']:,.2f}"
+                    },
+                    observaciones=f"Factura emitida con {len(res_fac['lineas'])} SKU(s) bajo aritmética exacta Decimal.",
+                    firmas=("Facturación y Finanzas", "Cliente / Receptor", "Contraloría Social")
+                )
+                st.session_state["ultimo_pdf_factura_emitida"] = pdf_fac_bytes
+                st.session_state["ultimo_cod_factura_emitida"] = res_fac["numero_factura"]
+                st.session_state.carrito_factura_items = []
+                st.success(f"Factura `{res_fac['numero_factura']}` emitida con {len(res_fac['lineas'])} SKU(s) por ${res_fac['total_usd']:,.2f} (Bs {res_fac['total_bs']:,.2f}) — Estado: `{res_fac['estado']}`.")
                 st.rerun()
             except Exception as e:
                 st.error(f"Error al emitir factura: {e}")
 
+        if st.session_state.get("ultimo_pdf_factura_emitida") is not None:
+            st.download_button(
+                label="Descargar Última Factura Emitida (PDF)",
+                data=st.session_state["ultimo_pdf_factura_emitida"],
+                file_name=f"{st.session_state.get('ultimo_cod_factura_emitida', 'Factura')}.pdf",
+                mime="application/pdf",
+                key="btn_descargar_ultima_factura_pdf"
+            )
+
         st.markdown("#### Libro de Facturas Emitidas y Control de Estados")
         st.dataframe(df_fac_f, use_container_width=True, hide_index=True)
+
+        df_fac_items_all = query_df("SELECT * FROM factura_items ORDER BY id DESC")
+        if not df_fac_items_all.empty:
+            st.markdown("##### Detalle por SKU de Facturas Emitidas")
+            st.dataframe(df_fac_items_all, use_container_width=True, hide_index=True)
 
         if not df_fac_f.empty:
             st.markdown("##### Anulación o Emisión de Nota de Crédito")
@@ -2524,9 +2868,25 @@ elif modulo_activo == "3. Finanzas, Facturación y Tesorería":
 
                 # Desglose de Rentabilidad por SKU
                 fac_validas_df = df_fac_f[df_fac_f["estado_documento"] != "ANULADA"].copy() if not df_fac_f.empty else pd.DataFrame()
+                df_f_items_rep = query_df("SELECT * FROM factura_items")
                 if not fac_validas_df.empty:
                     sku_stats = {}
-                    for _, r_sku in fac_validas_df.iterrows():
+                    validas_nums = set(fac_validas_df["numero_factura"].astype(str).tolist())
+                    items_validos = df_f_items_rep[df_f_items_rep["numero_factura"].astype(str).isin(validas_nums)] if not df_f_items_rep.empty else pd.DataFrame()
+                    facs_con_items = set(items_validos["numero_factura"].astype(str).tolist()) if not items_validos.empty else set()
+
+                    if not items_validos.empty:
+                        for _, r_it in items_validos.iterrows():
+                            s_cod = str(r_it["sku"])
+                            s_nom = str(r_it["descripcion"])
+                            v_neta = redondear_moneda(a_decimal(r_it["subtotal_usd"]))
+                            c_tot = redondear_moneda(a_decimal(r_it["cantidad"]) * a_decimal(r_it["costo_unitario_usd"]))
+                            if s_cod not in sku_stats:
+                                sku_stats[s_cod] = {"nombre": s_nom, "ventas": Decimal("0.00"), "costo": Decimal("0.00")}
+                            sku_stats[s_cod]["ventas"] = redondear_moneda(sku_stats[s_cod]["ventas"] + v_neta)
+                            sku_stats[s_cod]["costo"] = redondear_moneda(sku_stats[s_cod]["costo"] + c_tot)
+
+                    for _, r_sku in fac_validas_df[~fac_validas_df["numero_factura"].astype(str).isin(facs_con_items)].iterrows():
                         s_cod = str(r_sku["sku"])
                         s_nom = str(r_sku["descripcion"])
                         v_neta = redondear_moneda(a_decimal(r_sku["subtotal_usd"]))
