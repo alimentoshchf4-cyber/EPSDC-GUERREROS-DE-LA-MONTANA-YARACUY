@@ -1,4 +1,3 @@
-
 import os
 import io
 import re
@@ -227,6 +226,25 @@ def asegurar_esquema_comercial_extendido():
         observaciones TEXT DEFAULT '',
         creado_por TEXT NOT NULL,
         actualizado_en TEXT NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS preventa_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        codigo_preventa TEXT NOT NULL,
+        sku TEXT NOT NULL,
+        producto_nombre TEXT NOT NULL,
+        cantidad REAL NOT NULL,
+        precio_unitario_usd REAL NOT NULL,
+        costo_unitario_usd REAL NOT NULL DEFAULT 0.0,
+        descuento_pct REAL NOT NULL DEFAULT 0.0,
+        impuesto_pct REAL NOT NULL DEFAULT 0.0,
+        subtotal_usd REAL NOT NULL,
+        descuento_usd REAL NOT NULL DEFAULT 0.0,
+        impuesto_usd REAL NOT NULL DEFAULT 0.0,
+        total_usd REAL NOT NULL,
+        stock_reservado REAL NOT NULL DEFAULT 0.0
     )
     """)
 
@@ -461,30 +479,348 @@ def evaluar_margen_minimo(precio_unitario_usd: float, costo_unitario_usd: float,
 def obtener_stock_reservado_sku(sku: str, excluir_preventa_id: int | None = None) -> float:
     conn = get_connection()
     cur = conn.cursor()
-    if excluir_preventa_id is not None:
-        cur.execute(
-            """
-            SELECT COALESCE(SUM(cantidad), 0) AS reservado
-            FROM preventas
-            WHERE sku = ?
-              AND estado_preventa IN ('Registrada / Preventa', 'Aprobada')
-              AND id != ?
-            """,
-            (sku, excluir_preventa_id)
-        )
+    cur.execute("SELECT COUNT(*) FROM preventa_items")
+    usa_items = cur.fetchone()[0] > 0
+
+    if usa_items:
+        if excluir_preventa_id is not None:
+            cur.execute(
+                """
+                SELECT COALESCE(SUM(pi.cantidad), 0) AS reservado
+                FROM preventa_items pi
+                JOIN preventas p ON p.codigo_preventa = pi.codigo_preventa
+                WHERE pi.sku = ?
+                  AND p.estado_preventa IN ('Registrada / Preventa', 'Aprobada')
+                  AND p.id != ?
+                """,
+                (sku, excluir_preventa_id)
+            )
+        else:
+            cur.execute(
+                """
+                SELECT COALESCE(SUM(pi.cantidad), 0) AS reservado
+                FROM preventa_items pi
+                JOIN preventas p ON p.codigo_preventa = pi.codigo_preventa
+                WHERE pi.sku = ?
+                  AND p.estado_preventa IN ('Registrada / Preventa', 'Aprobada')
+                """,
+                (sku,)
+            )
     else:
-        cur.execute(
-            """
-            SELECT COALESCE(SUM(cantidad), 0) AS reservado
-            FROM preventas
-            WHERE sku = ?
-              AND estado_preventa IN ('Registrada / Preventa', 'Aprobada')
-            """,
-            (sku,)
-        )
+        if excluir_preventa_id is not None:
+            cur.execute(
+                """
+                SELECT COALESCE(SUM(cantidad), 0) AS reservado
+                FROM preventas
+                WHERE sku = ?
+                  AND estado_preventa IN ('Registrada / Preventa', 'Aprobada')
+                  AND id != ?
+                """,
+                (sku, excluir_preventa_id)
+            )
+        else:
+            cur.execute(
+                """
+                SELECT COALESCE(SUM(cantidad), 0) AS reservado
+                FROM preventas
+                WHERE sku = ?
+                  AND estado_preventa IN ('Registrada / Preventa', 'Aprobada')
+                """,
+                (sku,)
+            )
     val = cur.fetchone()["reservado"]
     conn.close()
     return float(val or 0.0)
+
+
+def crear_preventa_multisku_atomica(
+    cli_row: dict,
+    vendedor: str,
+    almacen_origen: str,
+    moneda: str,
+    tasa_bcv: float,
+    condicion_pago: str,
+    escala_precio: str,
+    estado_inicial: str,
+    items: list,
+    observaciones: str,
+    user_ctx: dict
+) -> dict:
+    if not items:
+        raise ValueError("Debe agregar al menos un SKU al prepedido antes de guardarlo.")
+
+    tasa_d = a_decimal(tasa_bcv, "1.00")
+    lineas_proc = []
+    sub_total_acc = Decimal("0.00")
+    desc_total_acc = Decimal("0.00")
+    imp_total_acc = Decimal("0.00")
+    total_usd_acc = Decimal("0.00")
+    req_aprob_any = 0
+
+    for it in items:
+        cant_d = a_decimal(it["cantidad"])
+        precio_d = a_decimal(it["precio_unitario_usd"])
+        costo_d = a_decimal(it.get("costo_unitario_usd", "0.00"))
+        desc_pct_d = a_decimal(it.get("descuento_pct", "0.00"))
+        imp_pct_d = a_decimal(it.get("impuesto_pct", "0.00"))
+
+        if cant_d <= Decimal("0.00") or precio_d <= Decimal("0.00"):
+            raise ValueError(f"Cantidad y precio deben ser mayores a cero en SKU {it.get('sku', '')}.")
+
+        sub_bruto = redondear_moneda(cant_d * precio_d)
+        desc_usd = redondear_moneda(sub_bruto * (desc_pct_d / Decimal("100")))
+        base_imp = max(Decimal("0.00"), redondear_moneda(sub_bruto - desc_usd))
+        imp_usd = redondear_moneda(base_imp * (imp_pct_d / Decimal("100")))
+        tot_lin = redondear_moneda(base_imp + imp_usd)
+
+        eval_m = evaluar_margen_minimo(float(precio_d), float(costo_d), float(desc_pct_d), margen_min_pct=15.0)
+        if not eval_m["cumple_margen"]:
+            req_aprob_any = 1
+
+        sub_total_acc = redondear_moneda(sub_total_acc + sub_bruto)
+        desc_total_acc = redondear_moneda(desc_total_acc + desc_usd)
+        imp_total_acc = redondear_moneda(imp_total_acc + imp_usd)
+        total_usd_acc = redondear_moneda(total_usd_acc + tot_lin)
+
+        lineas_proc.append({
+            "sku": str(it["sku"]).strip(),
+            "producto_nombre": str(it["producto_nombre"]).strip(),
+            "cantidad": cant_d,
+            "precio_unitario_usd": precio_d,
+            "costo_unitario_usd": costo_d,
+            "descuento_pct": desc_pct_d,
+            "impuesto_pct": imp_pct_d,
+            "subtotal_usd": sub_bruto,
+            "descuento_usd": desc_usd,
+            "impuesto_usd": imp_usd,
+            "total_usd": tot_lin,
+            "margen_pct": eval_m["margen_pct"],
+        })
+
+    total_bs_acc = redondear_moneda(total_usd_acc * tasa_d)
+    reserva_activa = estado_inicial in ["Registrada / Preventa", "Aprobada"]
+    stock_res_total = float(sum((l["cantidad"] for l in lineas_proc), Decimal("0.00"))) if reserva_activa else 0.0
+
+    if len(lineas_proc) == 1:
+        sku_hdr = lineas_proc[0]["sku"]
+        prod_hdr = lineas_proc[0]["producto_nombre"]
+        cant_hdr = float(lineas_proc[0]["cantidad"])
+        precio_hdr = float(lineas_proc[0]["precio_unitario_usd"])
+        desc_hdr = float(lineas_proc[0]["descuento_pct"])
+        imp_hdr = float(lineas_proc[0]["impuesto_pct"])
+    else:
+        sku_hdr = "MULTI-SKU"
+        prod_hdr = f"Prepedido Multi-SKU ({len(lineas_proc)} ítems): " + ", ".join(
+            f"{l['sku']} x{l['cantidad']:g}" for l in lineas_proc[:4]
+        ) + ("..." if len(lineas_proc) > 4 else "")
+        cant_hdr = float(sum((l["cantidad"] for l in lineas_proc), Decimal("0.00")))
+        precio_hdr = float(redondear_moneda(total_usd_acc / a_decimal(cant_hdr, "1.00"))) if cant_hdr > 0 else 0.0
+        desc_hdr = 0.0
+        imp_hdr = 0.0
+
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if reserva_activa:
+            for l in lineas_proc:
+                cur.execute("SELECT stock_actual FROM inventario WHERE sku = ?", (l["sku"],))
+                inv_r = cur.fetchone()
+                stk_fisico = a_decimal(inv_r["stock_actual"]) if inv_r else Decimal("0.00")
+                cur.execute(
+                    """
+                    SELECT COALESCE(SUM(pi.cantidad), 0) AS res
+                    FROM preventa_items pi
+                    JOIN preventas p ON p.codigo_preventa = pi.codigo_preventa
+                    WHERE pi.sku = ? AND p.estado_preventa IN ('Registrada / Preventa', 'Aprobada')
+                    """,
+                    (l["sku"],)
+                )
+                stk_res = a_decimal(cur.fetchone()["res"])
+                stk_disp = stk_fisico - stk_res
+                if l["cantidad"] > stk_disp:
+                    raise ValueError(
+                        f"Stock disponible insuficiente para SKU {l['sku']} ({stk_disp:,.2f} disp. vs {l['cantidad']:,.2f} solicitadas)."
+                    )
+
+        cod_prev = generar_codigo("PREV", "preventas")
+        fecha_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+        aprob_por = user_ctx["username"] if estado_inicial == "Aprobada" else ""
+
+        cur.execute(
+            """
+            INSERT INTO preventas
+            (codigo_preventa, fecha, cliente_id, codigo_cliente, cliente_nombre, rif_cliente,
+             vendedor, territorio, municipio, almacen_origen, moneda, tasa_bcv, condicion_pago,
+             escala_precio, sku, producto_nombre, cantidad, precio_unitario_usd, descuento_pct,
+             impuesto_pct, subtotal_usd, descuento_usd, impuesto_usd, total_usd, total_bs,
+             stock_reservado, estado_preventa, requiere_aprobacion, aprobado_por,
+             codigo_venta_vinculado, observaciones, creado_por, actualizado_en)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?)
+            """,
+            (
+                cod_prev, fecha_str, int(cli_row["id"]), cli_row["codigo_cliente"],
+                cli_row["nombre_comercio"], cli_row["rif_cedula"], vendedor,
+                cli_row["territorio"], cli_row["municipio"], almacen_origen, moneda,
+                float(tasa_d), condicion_pago, escala_precio, sku_hdr, prod_hdr[:240],
+                cant_hdr, precio_hdr, desc_hdr, imp_hdr,
+                float(sub_total_acc), float(desc_total_acc), float(imp_total_acc),
+                float(total_usd_acc), float(total_bs_acc), stock_res_total, estado_inicial,
+                req_aprob_any, aprob_por, normalizar_texto_titulo(observaciones), user_ctx["username"], fecha_str
+            )
+        )
+
+        for l in lineas_proc:
+            res_item = float(l["cantidad"]) if reserva_activa else 0.0
+            cur.execute(
+                """
+                INSERT INTO preventa_items
+                (codigo_preventa, sku, producto_nombre, cantidad, precio_unitario_usd,
+                 costo_unitario_usd, descuento_pct, impuesto_pct, subtotal_usd,
+                 descuento_usd, impuesto_usd, total_usd, stock_reservado)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    cod_prev, l["sku"], l["producto_nombre"], float(l["cantidad"]),
+                    float(l["precio_unitario_usd"]), float(l["costo_unitario_usd"]),
+                    float(l["descuento_pct"]), float(l["impuesto_pct"]),
+                    float(l["subtotal_usd"]), float(l["descuento_usd"]),
+                    float(l["impuesto_usd"]), float(l["total_usd"]), res_item
+                )
+            )
+
+        cur.execute(
+            """
+            INSERT INTO historial_preventas
+            (codigo_preventa, estado_anterior, estado_nuevo, usuario, rol, motivo, fecha)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (cod_prev, "N/A", estado_inicial, user_ctx["username"], obtener_nivel_acceso_comercial(user_ctx), f"Creación de prepedido multi-SKU ({len(lineas_proc)} líneas)", fecha_str)
+        )
+        conn.commit()
+        registrar_auditoria_comercial(
+            user_ctx, "Preventas", "CREAR_PREPEDIDO_MULTISKU", cod_prev,
+            f"{len(lineas_proc)} SKUs | Total ${total_usd_acc:,.2f} | Estado: {estado_inicial}"
+        )
+        return {
+            "codigo_preventa": cod_prev,
+            "subtotal_usd": sub_total_acc,
+            "descuento_usd": desc_total_acc,
+            "impuesto_usd": imp_total_acc,
+            "total_usd": total_usd_acc,
+            "total_bs": total_bs_acc,
+            "lineas": lineas_proc
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def registrar_cliente_atomico(
+    nombre_raw: str,
+    rif_raw: str,
+    tel_raw: str,
+    dir_raw: str,
+    territorio: str,
+    municipio: str,
+    geo_raw: str,
+    segmento: str,
+    vendedor: str,
+    estado_cliente: str,
+    modo_codigo: str,
+    limite_credito_usd: float,
+    dias_credito: int,
+    obs_raw: str,
+    user_ctx: dict
+) -> dict:
+    nombre_norm = normalizar_texto_titulo(nombre_raw)
+    rif_norm = normalizar_rif_cedula(rif_raw)
+    tel_norm = normalizar_telefono(tel_raw)
+    dir_norm = normalizar_texto_titulo(dir_raw)
+    geo_norm = normalizar_texto_titulo(geo_raw)
+
+    if not nombre_norm or not rif_norm or not tel_norm or not dir_norm:
+        raise ValueError("Complete Nombre/Comercio, RIF/Cédula, Teléfono y Dirección antes de registrar.")
+
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cur.execute(
+            "SELECT codigo_cliente, nombre_comercio FROM clientes_cartera WHERE REPLACE(UPPER(rif_cedula), '-', '') = ? OR LOWER(nombre_comercio) = LOWER(?)",
+            (re.sub(r"[^A-Z0-9]", "", rif_norm), nombre_norm)
+        )
+        dup = cur.fetchone()
+        if dup:
+            raise ValueError(f"Registro duplicado detectado: ya existe el cliente `{dup['codigo_cliente']}` ({dup['nombre_comercio']}).")
+
+        zon_match = re.search(r"(\d+)", territorio or "")
+        num_zona = zon_match.group(1).zfill(2) if zon_match else "00"
+        prefijo = f"CLI-Z{num_zona}"
+
+        if modo_codigo == "Basado en RIF Normalizado" and rif_norm:
+            base_code = f"CLI-{re.sub(r'[^A-Z0-9]', '', rif_norm)}"
+            cur.execute("SELECT COUNT(*) FROM clientes_cartera WHERE codigo_cliente = ?", (base_code,))
+            if cur.fetchone()[0] == 0:
+                cod_cli = base_code
+            else:
+                idx_c = 2
+                while True:
+                    cand = f"{base_code}-{idx_c:02d}"
+                    cur.execute("SELECT COUNT(*) FROM clientes_cartera WHERE codigo_cliente = ?", (cand,))
+                    if cur.fetchone()[0] == 0:
+                        cod_cli = cand
+                        break
+                    idx_c += 1
+        else:
+            cur.execute("SELECT codigo_cliente FROM clientes_cartera WHERE codigo_cliente LIKE ?", (f"{prefijo}-%",))
+            cods = [r["codigo_cliente"] for r in cur.fetchall()]
+            max_seq = 0
+            for c in cods:
+                m = re.search(r"-(\d+)$", c)
+                if m:
+                    max_seq = max(max_seq, int(m.group(1)))
+            while True:
+                max_seq += 1
+                cand = f"{prefijo}-{max_seq:06d}"
+                cur.execute("SELECT COUNT(*) FROM clientes_cartera WHERE codigo_cliente = ?", (cand,))
+                if cur.fetchone()[0] == 0:
+                    cod_cli = cand
+                    break
+
+        ahora_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+        cur.execute(
+            """
+            INSERT INTO clientes_cartera
+            (codigo_cliente, nombre_comercio, rif_cedula, telefono, direccion, territorio, municipio,
+             geolocalizacion, segmento, vendedor_asignado, estado_cliente, limite_credito_usd,
+             dias_credito, saldo_pendiente_usd, fecha_ultima_compra, observaciones, creado_en, actualizado_en)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0.0, '', ?, ?, ?)
+            """,
+            (
+                cod_cli, nombre_norm, rif_norm, tel_norm, dir_norm, territorio, municipio,
+                geo_norm, segmento, vendedor, estado_cliente, float(limite_credito_usd),
+                int(dias_credito), normalizar_texto_titulo(obs_raw), ahora_str, ahora_str
+            )
+        )
+        conn.commit()
+        registrar_auditoria_comercial(
+            user_ctx, "Clientes", "CREAR_CLIENTE_ATOMICO", cod_cli,
+            f"Cliente {nombre_norm} ({rif_norm}) en {territorio} | Estado: {estado_cliente}"
+        )
+        return {
+            "codigo_cliente": cod_cli,
+            "nombre_comercio": nombre_norm,
+            "rif_cedula": rif_norm,
+            "telefono": tel_norm
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def calcular_kpis_comerciales(df_ventas: pd.DataFrame, df_preventas: pd.DataFrame, df_clientes: pd.DataFrame, df_inv: pd.DataFrame, meta_diaria_usd: float, meta_mensual_usd: float) -> dict:
@@ -821,6 +1157,98 @@ def asegurar_esquema_finanzas_robusto():
         fecha TEXT NOT NULL
     )
     """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS suministros_materiales (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        codigo_suministro TEXT UNIQUE NOT NULL,
+        nombre TEXT NOT NULL,
+        categoria TEXT NOT NULL,
+        unidad_medida TEXT NOT NULL,
+        stock_actual REAL NOT NULL DEFAULT 0.0,
+        stock_minimo REAL NOT NULL DEFAULT 5.0,
+        costo_unitario_usd REAL NOT NULL DEFAULT 0.0,
+        ubicacion_bodega TEXT NOT NULL DEFAULT 'Depósito de Suministros y Materiales',
+        estado TEXT NOT NULL DEFAULT 'Activo'
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS movimientos_suministros (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        codigo_doc TEXT UNIQUE NOT NULL,
+        fecha TEXT NOT NULL,
+        tipo_movimiento TEXT NOT NULL,
+        codigo_suministro TEXT NOT NULL,
+        nombre_suministro TEXT NOT NULL,
+        cantidad REAL NOT NULL,
+        costo_unitario_usd REAL NOT NULL DEFAULT 0.0,
+        total_usd REAL NOT NULL DEFAULT 0.0,
+        area_solicitante TEXT NOT NULL,
+        responsable TEXT NOT NULL,
+        observaciones TEXT DEFAULT ''
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS afectacion_cuentas_presupuesto (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        codigo_afectacion TEXT UNIQUE NOT NULL,
+        fecha TEXT NOT NULL,
+        periodo TEXT NOT NULL,
+        codigo_cuenta TEXT NOT NULL,
+        nombre_cuenta TEXT NOT NULL,
+        unidad_o_centro TEXT NOT NULL,
+        partida_rubro TEXT NOT NULL,
+        tipo_afectacion TEXT NOT NULL,
+        doc_origen TEXT DEFAULT '',
+        concepto TEXT NOT NULL,
+        monto_usd REAL NOT NULL,
+        tasa_bcv REAL NOT NULL,
+        monto_bs REAL NOT NULL,
+        estado_afectacion TEXT NOT NULL DEFAULT 'Ejecutado',
+        responsable TEXT NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS pasarela_pago_movil (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        codigo_operacion TEXT UNIQUE NOT NULL,
+        fecha TEXT NOT NULL,
+        tipo_flujo TEXT NOT NULL,
+        banco_emisor TEXT NOT NULL,
+        banco_receptor TEXT NOT NULL,
+        telefono_pagador TEXT NOT NULL,
+        cedula_rif_pagador TEXT NOT NULL,
+        referencia_bancaria TEXT NOT NULL,
+        monto_bs REAL NOT NULL,
+        tasa_bcv REAL NOT NULL,
+        monto_usd REAL NOT NULL,
+        doc_vinculado TEXT DEFAULT '',
+        cliente_tercero TEXT NOT NULL,
+        codigo_cuenta_destino TEXT NOT NULL,
+        estado_validacion TEXT NOT NULL DEFAULT 'Conciliado',
+        responsable TEXT NOT NULL
+    )
+    """)
+
+    cur.execute("SELECT COUNT(*) FROM suministros_materiales")
+    if cur.fetchone()[0] == 0:
+        suministros_ini = [
+            ("SUM-EMP-001", "Bolsas Laminadas Valvuladas 500g Por Tu Café", "Empaques y Etiquetas", "Paquete x100", 45.0, 15.0, 18.50, "Depósito Empaques Nirgua", "Activo"),
+            ("SUM-EMP-002", "Sacos de Fique / Polipropileno 60kg", "Empaques y Etiquetas", "Unidad", 120.0, 30.0, 1.35, "Almacén Principal Nirgua", "Activo"),
+            ("SUM-REP-001", "Correas y Rodamientos Torrefactora / Trilladora", "Repuestos y Mantenimiento", "Kit", 8.0, 3.0, 42.00, "Taller Mantenimiento", "Activo"),
+            ("SUM-OFI-001", "Resma Papel Carta, Talonarios y Precintos Seguridad", "Materiales de Oficina y Planta", "Paquete", 20.0, 5.0, 6.50, "Oficina Administrativa", "Activo")
+        ]
+        cur.executemany(
+            """
+            INSERT INTO suministros_materiales
+            (codigo_suministro, nombre, categoria, unidad_medida, stock_actual, stock_minimo, costo_unitario_usd, ubicacion_bodega, estado)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            suministros_ini
+        )
 
     cur.execute("SELECT COUNT(*) FROM cuentas_tesoreria")
     if cur.fetchone()[0] == 0:
@@ -1508,6 +1936,243 @@ def abonar_cxp_atomico(codigo_cxp: str, monto_pago, codigo_cuenta: str, metodo_p
 
 
 
+
+def registrar_afectacion_cuenta_presupuesto_atomica(
+    periodo: str,
+    codigo_cuenta: str,
+    unidad_o_centro: str,
+    partida_rubro: str,
+    tipo_afectacion: str,
+    doc_origen: str,
+    concepto: str,
+    monto_usd,
+    tasa_bcv: float,
+    afectar_saldo_cuenta: bool,
+    responsable: str,
+    user_ctx: dict
+) -> dict:
+    monto_d = redondear_moneda(a_decimal(monto_usd))
+    tasa_d = a_decimal(tasa_bcv, "1.00")
+    if monto_d <= Decimal("0.00"):
+        raise ValueError("El monto de la afectación presupuestaria debe ser mayor a cero.")
+    if not concepto.strip():
+        raise ValueError("Debe indicar el concepto de la afectación presupuestaria.")
+
+    monto_bs = redondear_moneda(monto_d * tasa_d)
+    fecha_now = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cur.execute("SELECT nombre_cuenta, saldo_actual FROM cuentas_tesoreria WHERE codigo_cuenta = ?", (codigo_cuenta,))
+        cta_r = cur.fetchone()
+        nombre_cta = cta_r["nombre_cuenta"] if cta_r else codigo_cuenta
+
+        cod_af = generar_codigo("AFP", "afectacion_cuentas_presupuesto")
+        cur.execute(
+            """
+            INSERT INTO afectacion_cuentas_presupuesto
+            (codigo_afectacion, fecha, periodo, codigo_cuenta, nombre_cuenta, unidad_o_centro,
+             partida_rubro, tipo_afectacion, doc_origen, concepto, monto_usd, tasa_bcv,
+             monto_bs, estado_afectacion, responsable)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Ejecutado', ?)
+            """,
+            (
+                cod_af, fecha_now, periodo.strip(), codigo_cuenta, nombre_cta,
+                unidad_o_centro, partida_rubro.strip(), tipo_afectacion,
+                doc_origen.strip(), concepto.strip(), float(monto_d), float(tasa_d),
+                float(monto_bs), responsable
+            )
+        )
+
+        if afectar_saldo_cuenta:
+            signo = -1.0 if tipo_afectacion in ["Cargo / Egreso Presupuestario", "Compromiso de Pago"] else 1.0
+            cur.execute(
+                "UPDATE cuentas_tesoreria SET saldo_actual = ROUND(saldo_actual + ?, 2) WHERE codigo_cuenta = ?",
+                (signo * float(monto_d), codigo_cuenta)
+            )
+            cod_rec = generar_codigo("REC", "tesoreria")
+            tipo_op_teso = "Egreso" if signo < 0 else "Ingreso"
+            cur.execute(
+                """
+                INSERT INTO tesoreria
+                (codigo_recibo, fecha, tipo_operacion, concepto, doc_asociado, tercero,
+                 metodo_pago, referencia, monto_usd, tasa_bcv, monto_bs, responsable)
+                VALUES (?, ?, ?, ?, ?, ?, 'Afectación Presupuestaria', ?, ?, ?, ?, ?)
+                """,
+                (
+                    cod_rec, fecha_now, tipo_op_teso,
+                    f"[{cod_af} | {unidad_o_centro}] {concepto.strip()}",
+                    cod_af, unidad_o_centro, cod_af, float(monto_d), float(tasa_d),
+                    float(monto_bs), responsable
+                )
+            )
+
+        conn.commit()
+        registrar_auditoria_comercial(
+            user_ctx, "Presupuesto", "AFECTAR_CUENTA_PRESUPUESTO", cod_af,
+            f"{codigo_cuenta} -> {unidad_o_centro} ({partida_rubro}) | ${monto_d:,.2f}"
+        )
+        return {
+            "codigo_afectacion": cod_af,
+            "monto_usd": monto_d,
+            "monto_bs": monto_bs,
+            "nombre_cuenta": nombre_cta
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def procesar_pago_movil_atomico(
+    tipo_flujo: str,
+    banco_emisor: str,
+    banco_receptor: str,
+    telefono_pagador: str,
+    cedula_rif_pagador: str,
+    referencia_bancaria: str,
+    monto_bs,
+    tasa_bcv: float,
+    doc_vinculado: str,
+    cliente_tercero: str,
+    codigo_cuenta_destino: str,
+    responsable: str,
+    user_ctx: dict
+) -> dict:
+    monto_bs_d = redondear_moneda(a_decimal(monto_bs))
+    tasa_d = a_decimal(tasa_bcv, "1.00")
+    if monto_bs_d <= Decimal("0.00"):
+        raise ValueError("El monto en Bolívares (Bs) del Pago Móvil debe ser mayor a cero.")
+    if not referencia_bancaria.strip() or len(re.sub(r"\D", "", referencia_bancaria)) < 4:
+        raise ValueError("Ingrese un número de referencia bancaria válido (mínimo 4 dígitos).")
+
+    tel_norm = normalizar_telefono(telefono_pagador)
+    rif_norm = normalizar_rif_cedula(cedula_rif_pagador)
+    ref_limpia = referencia_bancaria.strip()
+    monto_usd_d = redondear_moneda(monto_bs_d / tasa_d)
+    fecha_now = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cur.execute(
+            "SELECT codigo_operacion FROM pasarela_pago_movil WHERE referencia_bancaria = ? AND banco_emisor = ?",
+            (ref_limpia, banco_emisor)
+        )
+        dup_pm = cur.fetchone()
+        if dup_pm:
+            raise ValueError(f"Referencia duplicada: la referencia `{ref_limpia}` de `{banco_emisor}` ya fue procesada en `{dup_pm['codigo_operacion']}`.")
+
+        cod_pm = generar_codigo("PMV", "pasarela_pago_movil")
+        cur.execute(
+            """
+            INSERT INTO pasarela_pago_movil
+            (codigo_operacion, fecha, tipo_flujo, banco_emisor, banco_receptor,
+             telefono_pagador, cedula_rif_pagador, referencia_bancaria, monto_bs,
+             tasa_bcv, monto_usd, doc_vinculado, cliente_tercero,
+             codigo_cuenta_destino, estado_validacion, responsable)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Conciliado', ?)
+            """,
+            (
+                cod_pm, fecha_now, tipo_flujo, banco_emisor, banco_receptor,
+                tel_norm, rif_norm, ref_limpia, float(monto_bs_d),
+                float(tasa_d), float(monto_usd_d), doc_vinculado.strip(),
+                cliente_tercero.strip(), codigo_cuenta_destino, responsable
+            )
+        )
+
+        es_cobro = tipo_flujo.startswith("Cobro")
+        tipo_teso = "Ingreso" if es_cobro else "Egreso"
+        signo_cta = 1.0 if es_cobro else -1.0
+
+        cod_rec = generar_codigo("REC", "tesoreria")
+        cur.execute(
+            """
+            INSERT INTO tesoreria
+            (codigo_recibo, fecha, tipo_operacion, concepto, doc_asociado, tercero,
+             metodo_pago, referencia, monto_usd, tasa_bcv, monto_bs, responsable)
+            VALUES (?, ?, ?, ?, ?, ?, 'Pago Móvil Interbancario', ?, ?, ?, ?, ?)
+            """,
+            (
+                cod_rec, fecha_now, tipo_teso,
+                f"Pasarela Pago Móvil ({banco_emisor} -> {banco_receptor}) | Tel: {tel_norm}",
+                doc_vinculado.strip() or cod_pm, cliente_tercero.strip(),
+                ref_limpia, float(monto_usd_d), float(tasa_d), float(monto_bs_d), responsable
+            )
+        )
+
+        cur.execute(
+            "UPDATE cuentas_tesoreria SET saldo_actual = ROUND(saldo_actual + ?, 2) WHERE codigo_cuenta = ?",
+            (signo_cta * float(monto_usd_d), codigo_cuenta_destino)
+        )
+
+        doc_v = doc_vinculado.strip()
+        if es_cobro and doc_v.startswith("FAC-"):
+            cur.execute("SELECT * FROM facturas_emitidas WHERE numero_factura = ?", (doc_v,))
+            fac_r = cur.fetchone()
+            if fac_r and fac_r["estado_documento"] != "ANULADA":
+                saldo_f = redondear_moneda(a_decimal(fac_r["saldo_pendiente_usd"]))
+                abono_f = min(saldo_f, monto_usd_d)
+                if abono_f > Decimal("0.00"):
+                    nuevo_cob = redondear_moneda(a_decimal(fac_r["monto_cobrado_usd"]) + abono_f)
+                    nuevo_sal = max(Decimal("0.00"), redondear_moneda(saldo_f - abono_f))
+                    est_f = "PAGADA" if nuevo_sal == Decimal("0.00") else "PARCIAL"
+                    cur.execute(
+                        """
+                        UPDATE facturas_emitidas
+                        SET monto_cobrado_usd = ?, saldo_pendiente_usd = ?, estado_documento = ?
+                        WHERE numero_factura = ?
+                        """,
+                        (float(nuevo_cob), float(nuevo_sal), est_f, doc_v)
+                    )
+                    cur.execute(
+                        """
+                        INSERT INTO movimientos_cxc
+                        (numero_factura, cliente_codigo, cliente_nombre, fecha_movimiento,
+                         tipo_movimiento, monto_usd, monto_bs, referencia, responsable)
+                        VALUES (?, ?, ?, ?, 'PAGO_MOVIL_CXC', ?, ?, ?, ?)
+                        """,
+                        (
+                            doc_v, fac_r["cliente_codigo"], fac_r["cliente_nombre"], fecha_now,
+                            float(abono_f), float(redondear_moneda(abono_f * tasa_d)),
+                            f"PM-{ref_limpia}", responsable
+                        )
+                    )
+                    cur.execute(
+                        """
+                        UPDATE clientes_cartera
+                        SET saldo_pendiente_usd = MAX(0.0, ROUND(saldo_pendiente_usd - ?, 2)),
+                            estado_cliente = CASE WHEN MAX(0.0, ROUND(saldo_pendiente_usd - ?, 2)) = 0 AND estado_cliente = 'Moroso' THEN 'Activo' ELSE estado_cliente END
+                        WHERE codigo_cliente = ?
+                        """,
+                        (float(abono_f), float(abono_f), fac_r["cliente_codigo"])
+                    )
+        elif es_cobro and doc_v.startswith("VTA-"):
+            cur.execute("UPDATE ventas SET estado_cobro = 'Cobrado' WHERE codigo_venta = ?", (doc_v,))
+
+        conn.commit()
+        registrar_auditoria_comercial(
+            user_ctx, "Pasarela Pago Móvil", "PAGO_MOVIL_CONCILIADO", cod_pm,
+            f"{tipo_flujo} | Ref: {ref_limpia} | Bs {monto_bs_d:,.2f} (${monto_usd_d:,.2f})"
+        )
+        return {
+            "codigo_operacion": cod_pm,
+            "codigo_recibo": cod_rec,
+            "monto_bs": monto_bs_d,
+            "monto_usd": monto_usd_d,
+            "referencia": ref_limpia
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 # ==============================================================================
 # ESTILOS CORPORATIVOS CSS
 # ==============================================================================
@@ -1551,7 +2216,9 @@ for key in [
     "ultimo_pdf_compra", "ultimo_cod_compra",
     "ultimo_pdf_tesoreria", "ultimo_cod_tesoreria",
     "ultimo_pdf_venta", "ultimo_cod_venta",
-    "ultimo_pdf_preventa", "ultimo_cod_preventa"
+    "ultimo_pdf_preventa", "ultimo_cod_preventa",
+    "ultimo_pdf_suministro", "ultimo_cod_suministro",
+    "ultimo_pdf_pago_movil", "ultimo_cod_pago_movil"
 ]:
     if key not in st.session_state:
         st.session_state[key] = None
@@ -1749,10 +2416,11 @@ if modulo_activo == "Panel Ejecutivo y Contraloría":
 # ==============================================================================
 elif modulo_activo == "1. Almacén, Recepción e Inventario":
     st.subheader("Unidad de Almacén, Recepción e Inventario (Custodia Física y Kardex)")
-    tab_entrada, tab_sku, tab_mov, tab_kardex = st.tabs([
+    tab_entrada, tab_sku, tab_mov, tab_sum, tab_kardex = st.tabs([
         "Entrada en Almacén",
         "Registro / Edición de SKU",
         "Otras Salidas / Ajustes",
+        "Suministros y Materiales",
         "Historial Kardex y Actas PDF"
     ])
 
@@ -2049,6 +2717,153 @@ elif modulo_activo == "1. Almacén, Recepción e Inventario":
                 key="btn_descargar_acta_almacen"
             )
 
+    with tab_sum:
+        st.markdown("#### Módulo de Suministros y Materiales (Empaques, Repuestos y Operación)")
+        st.caption("Administra insumos no inventariables en SKU de venta (empaques, etiquetas, repuestos, oficina/planta) con entradas, salidas y acta PDF.")
+
+        df_sum_act = query_df("SELECT * FROM suministros_materiales ORDER BY codigo_suministro ASC")
+        df_mov_sum = query_df("SELECT * FROM movimientos_suministros ORDER BY id DESC")
+
+        s_m1, s_m2, s_m3 = st.columns(3)
+        tot_sum_items = int(len(df_sum_act)) if not df_sum_act.empty else 0
+        val_sum_usd = float((df_sum_act["stock_actual"] * df_sum_act["costo_unitario_usd"]).sum()) if not df_sum_act.empty else 0.0
+        bajos_sum = int(len(df_sum_act[df_sum_act["stock_actual"] <= df_sum_act["stock_minimo"]])) if not df_sum_act.empty else 0
+        s_m1.metric("Ítems de Suministros", f"{tot_sum_items}")
+        s_m2.metric("Valorización Suministros ($)", f"${val_sum_usd:,.2f}", f"Bs {val_sum_usd * tasa_bcv_global:,.2f}")
+        s_m3.metric("Alertas Stock Mínimo", f"{bajos_sum}")
+
+        with st.expander("Registrar Nuevo Suministro / Material en Catálogo"):
+            with st.form("form_nuevo_suministro_alm"):
+                sc1, sc2, sc3, sc4 = st.columns(4)
+                cod_s_new = sc1.text_input("Código Suministro", placeholder="Ej: SUM-EMP-003").strip().upper()
+                nom_s_new = sc2.text_input("Nombre del Suministro / Material", placeholder="Ej: Etiquetas Código de Barras")
+                cat_s_new = sc3.selectbox("Categoría", ["Empaques y Etiquetas", "Repuestos y Mantenimiento", "Materiales de Oficina y Planta", "Limpieza y Bioseguridad", "Otros Insumos"])
+                und_s_new = sc4.text_input("Unidad de Medida", value="Unidad").strip()
+
+                sc5, sc6, sc7, sc8 = st.columns(4)
+                stk_s_ini = sc5.number_input("Stock Inicial", min_value=0.0, value=10.0, step=1.0)
+                stk_s_min = sc6.number_input("Stock Mínimo", min_value=0.0, value=3.0, step=1.0)
+                cst_s_u = sc7.number_input("Costo Unitario ($ USD)", min_value=0.0, value=5.0, step=0.5)
+                ub_s_new = sc8.text_input("Ubicación Bodega", value="Depósito de Suministros y Materiales")
+
+                btn_add_sum = st.form_submit_button("Guardar Suministro en Catálogo", type="primary")
+
+            if btn_add_sum:
+                if not cod_s_new or not nom_s_new or not und_s_new:
+                    st.error("Complete Código, Nombre y Unidad de Medida.")
+                else:
+                    conn = get_connection()
+                    cur = conn.cursor()
+                    cur.execute("SELECT COUNT(*) FROM suministros_materiales WHERE codigo_suministro = ?", (cod_s_new,))
+                    if cur.fetchone()[0] > 0:
+                        cur.execute(
+                            """
+                            UPDATE suministros_materiales
+                            SET nombre = ?, categoria = ?, unidad_medida = ?,
+                                stock_actual = ?, stock_minimo = ?, costo_unitario_usd = ?, ubicacion_bodega = ?
+                            WHERE codigo_suministro = ?
+                            """,
+                            (nom_s_new, cat_s_new, und_s_new, float(stk_s_ini), float(stk_s_min), float(cst_s_u), ub_s_new.strip(), cod_s_new)
+                        )
+                        msg_s = f"Suministro `{cod_s_new}` actualizado."
+                    else:
+                        cur.execute(
+                            """
+                            INSERT INTO suministros_materiales
+                            (codigo_suministro, nombre, categoria, unidad_medida, stock_actual, stock_minimo, costo_unitario_usd, ubicacion_bodega, estado)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Activo')
+                            """,
+                            (cod_s_new, nom_s_new, cat_s_new, und_s_new, float(stk_s_ini), float(stk_s_min), float(cst_s_u), ub_s_new.strip())
+                        )
+                        msg_s = f"Suministro `{cod_s_new}` registrado en catálogo."
+                    conn.commit()
+                    conn.close()
+                    registrar_auditoria_comercial(user, "Suministros", "CATALOGO_SUMINISTRO", cod_s_new, msg_s)
+                    st.success(msg_s)
+                    st.rerun()
+
+        st.markdown("##### Catálogo y Existencias de Suministros y Materiales")
+        st.dataframe(df_sum_act, use_container_width=True, hide_index=True)
+
+        if not df_sum_act.empty:
+            st.markdown("##### Registrar Entrada o Salida de Suministro y Generar Acta PDF")
+            with st.form("form_mov_suministro_alm"):
+                ms1, ms2, ms3, ms4 = st.columns(4)
+                tipo_ms = ms1.selectbox("Tipo Movimiento", ["Entrada - Recepción Suministro", "Salida - Consumo / Entrega"])
+                item_ms = ms2.selectbox("Suministro / Material", df_sum_act["codigo_suministro"] + " | " + df_sum_act["nombre"] + " (Stock: " + df_sum_act["stock_actual"].astype(str) + ")")
+                cant_ms = ms3.number_input("Cantidad", min_value=0.01, value=2.0, step=1.0)
+                area_ms = ms4.text_input("Área Solicitante / Origen", value="Planta de Torrefacción / Empaque")
+
+                obs_ms = st.text_input("Observaciones / Destino / Orden")
+                btn_mov_ms = st.form_submit_button("Registrar Movimiento y Generar Acta PDF", type="primary")
+
+            if btn_mov_ms:
+                cod_s_sel = item_ms.split(" | ")[0]
+                s_row = df_sum_act[df_sum_act["codigo_suministro"] == cod_s_sel].iloc[0]
+                stk_act_s = float(s_row["stock_actual"])
+                cant_ms_f = float(cant_ms)
+                es_sal_s = tipo_ms.startswith("Salida")
+
+                if es_sal_s and stk_act_s < cant_ms_f:
+                    st.error(f"Stock insuficiente de `{cod_s_sel}` ({stk_act_s:,.2f} disponibles).")
+                else:
+                    nuevo_stk_s = (stk_act_s - cant_ms_f) if es_sal_s else (stk_act_s + cant_ms_f)
+                    costo_u_s = float(s_row["costo_unitario_usd"])
+                    tot_s_usd = cant_ms_f * costo_u_s
+                    cod_doc_s = generar_codigo("SUM", "movimientos_suministros")
+                    f_now_s = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+                    conn = get_connection()
+                    cur = conn.cursor()
+                    cur.execute("UPDATE suministros_materiales SET stock_actual = ? WHERE codigo_suministro = ?", (nuevo_stk_s, cod_s_sel))
+                    cur.execute(
+                        """
+                        INSERT INTO movimientos_suministros
+                        (codigo_doc, fecha, tipo_movimiento, codigo_suministro, nombre_suministro,
+                         cantidad, costo_unitario_usd, total_usd, area_solicitante, responsable, observaciones)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (cod_doc_s, f_now_s, tipo_ms, cod_s_sel, s_row["nombre"], cant_ms_f, costo_u_s, tot_s_usd, area_ms.strip(), user["username"], obs_ms.strip())
+                    )
+                    conn.commit()
+                    conn.close()
+
+                    registrar_auditoria_comercial(user, "Suministros", "MOV_SUMINISTRO", cod_doc_s, f"{tipo_ms} | {cod_s_sel} x{cant_ms_f:g} | {area_ms.strip()}")
+
+                    pdf_s_bytes = generar_pdf_comprobante(
+                        titulo_documento="Acta de Suministros y Materiales Operativos",
+                        codigo_documento=cod_doc_s,
+                        unidad_emisora="Unidad de Almacén, Recepción e Inventario",
+                        datos_generales={
+                            "Tipo Movimiento": tipo_ms,
+                            "Fecha y Hora": f_now_s,
+                            "Área Solicitante / Origen": area_ms.strip(),
+                            "Ubicación Bodega": s_row["ubicacion_bodega"],
+                            "Responsable": user["nombre_completo"],
+                            "Valor Ref. ($)": f"${tot_s_usd:,.2f}"
+                        },
+                        columnas_tabla=["Código", "Suministro / Material", "Unidad", "Cantidad", "Saldo Final"],
+                        filas_tabla=[[cod_s_sel, s_row["nombre"], s_row["unidad_medida"], f"{cant_ms_f:,.2f}", f"{nuevo_stk_s:,.2f}"]],
+                        observaciones=obs_ms.strip() or "Movimiento de suministros y materiales verificado físicamente.",
+                        firmas=("Jefe de Almacén", "Área Solicitante / Entrega", "Contraloría Social")
+                    )
+                    st.session_state.ultimo_pdf_suministro = pdf_s_bytes
+                    st.session_state.ultimo_cod_suministro = cod_doc_s
+                    st.success(f"Movimiento `{cod_doc_s}` registrado. Saldo actual de `{cod_s_sel}`: {nuevo_stk_s:,.2f} {s_row['unidad_medida']}.")
+                    st.rerun()
+
+        if st.session_state.ultimo_pdf_suministro is not None:
+            st.download_button(
+                label="Descargar Última Acta de Suministros (PDF)",
+                data=st.session_state.ultimo_pdf_suministro,
+                file_name=f"{st.session_state.ultimo_cod_suministro}.pdf",
+                mime="application/pdf",
+                key="btn_descargar_acta_suministro"
+            )
+
+        st.markdown("##### Historial de Movimientos de Suministros y Materiales")
+        st.dataframe(df_mov_sum, use_container_width=True, hide_index=True)
+
     with tab_kardex:
         df_kardex = query_df("SELECT * FROM movimientos_almacen ORDER BY id DESC")
         st.dataframe(df_kardex, use_container_width=True, hide_index=True)
@@ -2158,12 +2973,13 @@ elif modulo_activo == "3. Finanzas, Facturación y Tesorería":
     df_gc_f = query_df("SELECT * FROM gastos_costos ORDER BY id DESC")
     df_pres_f = query_df("SELECT * FROM presupuestos_partidas ORDER BY id DESC")
 
-    t_fac, t_teso, t_cxc_cxp, t_cg_pres, t_ana = st.tabs([
+    t_fac, t_teso, t_pmv, t_cxc_cxp, t_cg_pres, t_ana = st.tabs([
         "1. Facturación y Control de Ingresos",
         "2. Tesorería y Flujo de Caja",
-        "3. CxC y CxP",
-        "4. Costos, Gastos y Presupuesto",
-        "5. Análisis Financiero"
+        "3. Pasarela Pago Móvil",
+        "4. CxC y CxP",
+        "5. Costos, Gastos y Presupuesto",
+        "6. Análisis Financiero"
     ])
 
     # --------------------------------------------------------------------------
@@ -2531,6 +3347,125 @@ elif modulo_activo == "3. Finanzas, Facturación y Tesorería":
     # --------------------------------------------------------------------------
     # 3. CUENTAS POR COBRAR (CxC) Y CUENTAS POR PAGAR (CxP)
     # --------------------------------------------------------------------------
+    with t_pmv:
+        st.markdown("### 3. Pasarela de Pago Móvil Interbancario y Conciliación Automática")
+        st.caption("Procesa cobros y pagos por Pago Móvil interbancario (Bs -> $ USD a tasa BCV vigente), valida referencias únicas y concilia cuentas/facturas.")
+
+        df_pmv_hist = query_df("SELECT * FROM pasarela_pago_movil ORDER BY id DESC")
+        pm_tot_bs = redondear_moneda(sum((a_decimal(r["monto_bs"]) for _, r in df_pmv_hist.iterrows()), Decimal("0.00"))) if not df_pmv_hist.empty else Decimal("0.00")
+        pm_tot_usd = redondear_moneda(sum((a_decimal(r["monto_usd"]) for _, r in df_pmv_hist.iterrows()), Decimal("0.00"))) if not df_pmv_hist.empty else Decimal("0.00")
+        pm_cnt = int(len(df_pmv_hist)) if not df_pmv_hist.empty else 0
+
+        pm1, pm2, pm3 = st.columns(3)
+        pm1.metric("Operaciones Pago Móvil", f"{pm_cnt}")
+        pm2.metric("Volumen Acumulado (Bs)", f"Bs {pm_tot_bs:,.2f}")
+        pm3.metric("Equivalente Referencial ($)", f"${pm_tot_usd:,.2f}", f"Tasa BCV: Bs {tasa_bcv_global:,.2f}/$")
+
+        bancos_ve = [
+            "0102 - Banco de Venezuela",
+            "0105 - Banco Mercantil",
+            "0108 - BBVA Provincial",
+            "0134 - Banesco",
+            "0114 - Bancaribe",
+            "0115 - Banco Exterior",
+            "0128 - Banco Caroní",
+            "0163 - Banco del Tesoro",
+            "0172 - Bancamiga",
+            "0191 - Banco Nacional de Crédito (BNC)"
+        ]
+
+        with st.form("form_pasarela_pago_movil"):
+            p1, p2, p3 = st.columns(3)
+            tipo_flujo_pm = p1.selectbox("Tipo de Operación", ["Cobro Cliente / Venta", "Pago Proveedor / Operativo"])
+            bco_emisor_pm = p2.selectbox("Banco Emisor", bancos_ve, index=0)
+            bco_receptor_pm = p3.selectbox("Banco Receptor", bancos_ve, index=3)
+
+            p4, p5, p6, p7 = st.columns(4)
+            tel_pm = p4.text_input("Teléfono Asociado", placeholder="Ej: 0414-5551234")
+            rif_pm = p5.text_input("Cédula o RIF Pagador", placeholder="Ej: V-18234567 o J-40129876-1")
+            ref_pm = p6.text_input("N° Referencia Bancaria", placeholder="Ej: 98451278")
+            monto_bs_pm = p7.number_input("Monto Operación (Bs)", min_value=0.01, value=500.00, step=10.00, format="%.2f")
+
+            p8, p9, p10 = st.columns(3)
+            tercero_pm = p8.text_input("Cliente / Comercio / Beneficiario", placeholder="Ej: Abasto La Montaña")
+            doc_vinc_pm = p9.text_input("Documento Vinculado (FAC- / VTA- / COMP-)", placeholder="Ej: FAC-2026-0001")
+            cta_dest_pm = p10.selectbox("Cuenta Tesorería Destino / Origen", df_cta_f["codigo_cuenta"] if not df_cta_f.empty else ["CTA-BCO-VES"], key="pmv_cta_dest")
+
+            eq_usd_preview = redondear_moneda(a_decimal(monto_bs_pm) / max(Decimal("0.01"), a_decimal(tasa_bcv_global)))
+            st.caption(f"Conversión estimada a tasa BCV vigente (Bs {tasa_bcv_global:,.2f}/$): **${eq_usd_preview:,.2f} USD**")
+
+            btn_proc_pm = st.form_submit_button("Procesar y Conciliar Pago Móvil + Comprobante PDF", type="primary")
+
+        if btn_proc_pm:
+            if not tercero_pm.strip() or not tel_pm.strip() or not rif_pm.strip():
+                st.error("Complete Tercero, Teléfono y Cédula/RIF para procesar el Pago Móvil.")
+            else:
+                try:
+                    res_pm = procesar_pago_movil_atomico(
+                        tipo_flujo=tipo_flujo_pm,
+                        banco_emisor=bco_emisor_pm,
+                        banco_receptor=bco_receptor_pm,
+                        telefono_pagador=tel_pm,
+                        cedula_rif_pagador=rif_pm,
+                        referencia_bancaria=ref_pm,
+                        monto_bs=monto_bs_pm,
+                        tasa_bcv=tasa_bcv_global,
+                        doc_vinculado=doc_vinc_pm,
+                        cliente_tercero=tercero_pm,
+                        codigo_cuenta_destino=cta_dest_pm,
+                        responsable=user["username"],
+                        user_ctx=user
+                    )
+                    fecha_pm_now = datetime.now().strftime("%Y-%m-%d %H:%M")
+                    pdf_pm_bytes = generar_pdf_comprobante(
+                        titulo_documento="Comprobante de Conciliación — Pasarela Pago Móvil",
+                        codigo_documento=res_pm["codigo_operacion"],
+                        unidad_emisora="Unidad Financiera y Tesorería (Pasarela Pago Móvil)",
+                        datos_generales={
+                            "Operación / Recibo": f"{res_pm['codigo_operacion']} / {res_pm['codigo_recibo']}",
+                            "Fecha y Hora": fecha_pm_now,
+                            "Modalidad": tipo_flujo_pm,
+                            "Tercero": tercero_pm.strip(),
+                            "Canales Bancarios": f"{bco_emisor_pm} -> {bco_receptor_pm}",
+                            "Ref. / Teléfono": f"{res_pm['referencia']} | {normalizar_telefono(tel_pm)}"
+                        },
+                        columnas_tabla=["Referencia", "Doc. Vinculado", "Tasa BCV", "Monto (Bs)", "Equiv. ($)"],
+                        filas_tabla=[[
+                            res_pm["referencia"],
+                            doc_vinc_pm.strip() or "Directo",
+                            f"Bs {a_decimal(tasa_bcv_global):,.2f}",
+                            f"Bs {res_pm['monto_bs']:,.2f}",
+                            f"${res_pm['monto_usd']:,.2f}"
+                        ]],
+                        totales={
+                            "MONTO CONCILIADO (Bs):": f"Bs {res_pm['monto_bs']:,.2f}",
+                            "EQUIVALENTE ($ USD):": f"${res_pm['monto_usd']:,.2f}"
+                        },
+                        observaciones=f"Pagador: {normalizar_rif_cedula(rif_pm)}. Cuenta afectada: {cta_dest_pm}. Conciliación atómica aplicada.",
+                        firmas=("Finanzas y Tesorería", "Pagador / Beneficiario", "Contraloría Social")
+                    )
+                    st.session_state.ultimo_pdf_pago_movil = pdf_pm_bytes
+                    st.session_state.ultimo_cod_pago_movil = res_pm["codigo_operacion"]
+                    st.success(
+                        f"Pago Móvil `{res_pm['codigo_operacion']}` conciliado (Recibo `{res_pm['codigo_recibo']}`) por "
+                        f"Bs {res_pm['monto_bs']:,.2f} (${res_pm['monto_usd']:,.2f} USD)."
+                    )
+                    st.rerun()
+                except Exception as e:
+                    st.error(str(e))
+
+        if st.session_state.ultimo_pdf_pago_movil is not None:
+            st.download_button(
+                label="Descargar Comprobante Pago Móvil (PDF)",
+                data=st.session_state.ultimo_pdf_pago_movil,
+                file_name=f"{st.session_state.ultimo_cod_pago_movil}.pdf",
+                mime="application/pdf",
+                key="btn_descargar_pdf_pago_movil"
+            )
+
+        st.markdown("#### Bitácora de Operaciones Pasarela Pago Móvil")
+        st.dataframe(df_pmv_hist, use_container_width=True, hide_index=True)
+
     with t_cxc_cxp:
         st.markdown("### 3. Cuentas por Cobrar (CxC) y Cuentas por Pagar (CxP)")
 
@@ -2691,6 +3626,70 @@ elif modulo_activo == "3. Finanzas, Facturación y Tesorería":
                 comp_df["desviacion_usd"] = comp_df["monto_presupuestado_usd"] - comp_df["monto_usd"]
                 comp_df["ejecucion_pct"] = comp_df.apply(lambda r: round((r["monto_usd"] / r["monto_presupuestado_usd"] * 100.0), 1) if r["monto_presupuestado_usd"] > 0 else 0.0, axis=1)
                 st.dataframe(comp_df[["unidad_o_centro", "monto_presupuestado_usd", "monto_usd", "desviacion_usd", "ejecucion_pct"]], use_container_width=True, hide_index=True)
+
+        st.markdown("---")
+        st.markdown("#### Afectación de Cuentas Financieras con Presupuestos (`afectacion_cuentas_presupuesto`)")
+        st.caption("Cruza cada afectación financiera por cuenta de tesorería, centro de costo y partida presupuestaria para auditar disponibilidad y ejecución.")
+
+        df_af_pres = query_df("SELECT * FROM afectacion_cuentas_presupuesto ORDER BY id DESC")
+
+        with st.form("form_afectacion_cuenta_presupuesto"):
+            af1, af2, af3, af4 = st.columns(4)
+            per_af = af1.text_input("Período (YYYY-MM)", value=datetime.now().strftime("%Y-%m"), key="afp_per")
+            cta_af = af2.selectbox("Cuenta Financiera", df_cta_f["codigo_cuenta"] + " | " + df_cta_f["nombre_cuenta"] if not df_cta_f.empty else ["CTA-CAJA-USD | Caja Efectivo Divisas Sede"], key="afp_cta")
+            cc_af = af3.selectbox("Unidad / Centro de Costo", ["Operaciones y Logística", "Administración y Gestión", "Compras y Acopio", "Comercialización y Ventas"], key="afp_cc")
+            tipo_af = af4.selectbox("Tipo de Afectación", ["Cargo / Egreso Presupuestario", "Compromiso de Pago", "Abono / Reintegro Presupuestario"], key="afp_tipo")
+
+            af5, af6, af7, af8 = st.columns(4)
+            rubro_af = af5.text_input("Partida / Rubro Presupuestario", value="Presupuesto Operativo Mensual", key="afp_rub")
+            doc_af = af6.text_input("Documento Origen", placeholder="Ej: COMP-2026-0001 / FAC-2026-0001", key="afp_doc")
+            monto_af = af7.number_input("Monto Afectación ($ USD)", min_value=0.01, value=100.0, step=10.0, key="afp_monto")
+            afectar_caja_af = af8.checkbox("Impactar Saldo Cuenta y Tesorería", value=True, key="afp_caja")
+
+            conc_af = st.text_input("Concepto / Justificación de la Afectación", placeholder="Ej: Ejecución presupuestaria de acopio / logística / mantenimiento", key="afp_conc")
+            btn_af_pres = st.form_submit_button("Registrar Afectación Cuenta vs. Presupuesto", type="primary")
+
+        if btn_af_pres:
+            try:
+                cod_cta_af = cta_af.split(" | ")[0]
+                res_af = registrar_afectacion_cuenta_presupuesto_atomica(
+                    periodo=per_af,
+                    codigo_cuenta=cod_cta_af,
+                    unidad_o_centro=cc_af,
+                    partida_rubro=rubro_af,
+                    tipo_afectacion=tipo_af,
+                    doc_origen=doc_af,
+                    concepto=conc_af,
+                    monto_usd=monto_af,
+                    tasa_bcv=tasa_bcv_global,
+                    afectar_saldo_cuenta=afectar_caja_af,
+                    responsable=user["username"],
+                    user_ctx=user
+                )
+                st.success(f"Afectación `{res_af['codigo_afectacion']}` registrada en `{cod_cta_af}` -> `{cc_af}` por ${res_af['monto_usd']:,.2f} (Bs {res_af['monto_bs']:,.2f}).")
+                st.rerun()
+            except Exception as e:
+                st.error(str(e))
+
+        st.markdown("##### Vista Consolidada: Presupuesto Asignado vs. Afectación de Cuentas")
+        if not df_pres_f.empty or not df_af_pres.empty:
+            p_base = df_pres_f.groupby("unidad_o_centro", as_index=False)["monto_presupuestado_usd"].sum() if not df_pres_f.empty else pd.DataFrame(columns=["unidad_o_centro", "monto_presupuestado_usd"])
+            if not df_af_pres.empty:
+                af_grp = df_af_pres.groupby(["unidad_o_centro", "codigo_cuenta"], as_index=False).agg(
+                    afectaciones=("codigo_afectacion", "count"),
+                    monto_afectado_usd=("monto_usd", "sum"),
+                    monto_afectado_bs=("monto_bs", "sum")
+                )
+                cruce_df = pd.merge(af_grp, p_base, on="unidad_o_centro", how="left").fillna({"monto_presupuestado_usd": 0.0})
+                cruce_df["saldo_presupuesto_usd"] = cruce_df["monto_presupuestado_usd"] - cruce_df["monto_afectado_usd"]
+                cruce_df["pct_afectacion"] = cruce_df.apply(
+                    lambda r: round((r["monto_afectado_usd"] / r["monto_presupuestado_usd"] * 100.0), 1) if r["monto_presupuestado_usd"] > 0 else 0.0,
+                    axis=1
+                )
+                st.dataframe(cruce_df, use_container_width=True, hide_index=True)
+
+        st.markdown("##### Detalle de Afectaciones (`afectacion_cuentas_presupuesto`)")
+        st.dataframe(df_af_pres, use_container_width=True, hide_index=True)
 
     # --------------------------------------------------------------------------
     # 5. ANÁLISIS FINANCIERO (LIQUIDEZ, RENTABILIDAD, GRÁFICOS Y PDF EJECUTIVO)
@@ -3054,47 +4053,31 @@ elif modulo_activo == "4. Despacho, Comercialización y Ventas":
             btn_guardar_cli = st.form_submit_button("Validar, Normalizar y Registrar Cliente", type="primary")
 
         if btn_guardar_cli:
-            nombre_norm = normalizar_texto_titulo(nombre_cli)
-            rif_norm = normalizar_rif_cedula(rif_cli_raw)
-            tel_norm = normalizar_telefono(tel_cli_raw)
-            dir_norm = normalizar_texto_titulo(dir_cli)
-            geo_norm = normalizar_texto_titulo(geo_cli)
-
-            if not nombre_norm or not rif_norm or not tel_norm or not dir_norm:
-                st.error("Complete Nombre/Comercio, RIF/Cédula, Teléfono y Dirección antes de registrar.")
-            else:
-                conn = get_connection()
-                cur = conn.cursor()
-                cur.execute(
-                    "SELECT codigo_cliente, nombre_comercio FROM clientes_cartera WHERE REPLACE(UPPER(rif_cedula), '-', '') = ? OR LOWER(nombre_comercio) = LOWER(?)",
-                    (re.sub(r"[^A-Z0-9]", "", rif_norm), nombre_norm)
+            try:
+                res_cli = registrar_cliente_atomico(
+                    nombre_raw=nombre_cli,
+                    rif_raw=rif_cli_raw,
+                    tel_raw=tel_cli_raw,
+                    dir_raw=dir_cli,
+                    territorio=territorio_cli,
+                    municipio=municipio_cli,
+                    geo_raw=geo_cli,
+                    segmento=segmento_cli,
+                    vendedor=vendedor_cli,
+                    estado_cliente=estado_cli,
+                    modo_codigo=modo_cod,
+                    limite_credito_usd=limite_cred,
+                    dias_credito=dias_cred,
+                    obs_raw=obs_cli,
+                    user_ctx=user
                 )
-                duplicado = cur.fetchone()
-                if duplicado:
-                    conn.close()
-                    st.error(f"Registro duplicado detectado: ya existe el cliente `{duplicado['codigo_cliente']}` ({duplicado['nombre_comercio']}).")
-                else:
-                    cod_cli = generar_codigo_cliente_unico(territorio_cli, rif_norm, modo_cod)
-                    ahora_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-                    cur.execute(
-                        """
-                        INSERT INTO clientes_cartera
-                        (codigo_cliente, nombre_comercio, rif_cedula, telefono, direccion, territorio, municipio,
-                         geolocalizacion, segmento, vendedor_asignado, estado_cliente, limite_credito_usd,
-                         dias_credito, saldo_pendiente_usd, fecha_ultima_compra, observaciones, creado_en, actualizado_en)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0.0, '', ?, ?, ?)
-                        """,
-                        (
-                            cod_cli, nombre_norm, rif_norm, tel_norm, dir_norm, territorio_cli, municipio_cli,
-                            geo_norm, segmento_cli, vendedor_cli, estado_cli, float(limite_cred),
-                            int(dias_cred), normalizar_texto_titulo(obs_cli), ahora_str, ahora_str
-                        )
-                    )
-                    conn.commit()
-                    conn.close()
-                    registrar_auditoria_comercial(user, "Clientes", "CREAR_CLIENTE", cod_cli, f"Cliente {nombre_norm} ({rif_norm}) en {territorio_cli} con estado {estado_cli}")
-                    st.success(f"Cliente registrado con código único `{cod_cli}` | RIF normalizado: `{rif_norm}` | Teléfono: `{tel_norm}`.")
-                    st.rerun()
+                st.success(
+                    f"Cliente persistido con código único `{res_cli['codigo_cliente']}` | "
+                    f"RIF normalizado: `{res_cli['rif_cedula']}` | Teléfono: `{res_cli['telefono']}`."
+                )
+                st.rerun()
+            except Exception as e:
+                st.error(str(e))
 
         st.markdown("#### Directorio de Clientes Normalizados")
         f_col1, f_col2 = st.columns(2)
@@ -3138,114 +4121,143 @@ elif modulo_activo == "4. Despacho, Comercialización y Ventas":
                 obs_prev = st.text_input("Observaciones de Cotización / Entrega")
                 submitted_prev = st.form_submit_button("Guardar Preventa y Generar Cotización PDF", type="primary")
 
-            if submitted_prev:
-                cod_cli_sel = cli_sel.split(" | ")[0]
-                cli_row = df_clientes[df_clientes["codigo_cliente"] == cod_cli_sel].iloc[0]
-                sku_p = prod_prev.split(" | ")[0]
-                prod_row = df_inv_all[df_inv_all["sku"] == sku_p].iloc[0]
+            if "carrito_preventa_items" not in st.session_state:
+                st.session_state.carrito_preventa_items = []
 
-                estado_cli_actual = cli_row["estado_cliente"]
+            cod_cli_preview = cli_sel.split(" | ")[0]
+            cli_row_preview = df_clientes[df_clientes["codigo_cliente"] == cod_cli_preview].iloc[0]
+            sku_p_preview = prod_prev.split(" | ")[0]
+            prod_row_preview = df_inv_all[df_inv_all["sku"] == sku_p_preview].iloc[0]
+            precio_base_prev = float(prod_row_preview["precio_mayor_usd"]) if escala_prev == "Mayorista" else float(prod_row_preview["precio_detal_usd"])
+            if precio_base_prev <= 0:
+                precio_base_prev = float(prod_row_preview["costo_unitario_usd"]) * 1.25
+
+            c_add_p1, c_add_p2 = st.columns([1, 2])
+            if c_add_p1.button("Agregar SKU al Prepedido Multi-SKU", key="btn_add_sku_prev"):
+                calc_p = calcular_lineas_preventa(cant_prev, precio_base_prev, desc_prev, imp_prev, tasa_bcv_global)
+                st.session_state.carrito_preventa_items.append({
+                    "sku": sku_p_preview,
+                    "producto_nombre": str(prod_row_preview["nombre"]),
+                    "cantidad": float(cant_prev),
+                    "precio_unitario_usd": float(precio_base_prev),
+                    "costo_unitario_usd": float(prod_row_preview["costo_unitario_usd"]),
+                    "descuento_pct": float(desc_prev),
+                    "impuesto_pct": float(imp_prev),
+                    "subtotal_usd": float(calc_p["subtotal_usd"]),
+                    "descuento_usd": float(calc_p["descuento_usd"]),
+                    "impuesto_usd": float(calc_p["impuesto_usd"]),
+                    "total_usd": float(calc_p["total_usd"]),
+                })
+                st.success(f"Agregado `{sku_p_preview}` ({cant_prev:g} und.) al prepedido multi-SKU.")
+                st.rerun()
+
+            if st.session_state.carrito_preventa_items:
+                df_cart_p = pd.DataFrame(st.session_state.carrito_preventa_items)
+                st.markdown("##### Ítems en Prepedido Multi-SKU Actual")
+                st.dataframe(
+                    df_cart_p[["sku", "producto_nombre", "cantidad", "precio_unitario_usd", "descuento_pct", "impuesto_pct", "total_usd"]],
+                    use_container_width=True,
+                    hide_index=True
+                )
+                tot_prev_cart = redondear_moneda(sum((a_decimal(x["total_usd"]) for x in st.session_state.carrito_preventa_items), Decimal("0.00")))
+                c_rm_p1, c_rm_p2 = st.columns([1, 1])
+                if c_rm_p1.button("Quitar Último Ítem", key="btn_rm_last_prev"):
+                    st.session_state.carrito_preventa_items.pop()
+                    st.rerun()
+                if c_rm_p2.button("Limpiar Prepedido Multi-SKU", key="btn_clr_prev"):
+                    st.session_state.carrito_preventa_items = []
+                    st.rerun()
+                st.caption(f"Total acumulado en prepedido multi-SKU: **${tot_prev_cart:,.2f} USD** (Bs {redondear_moneda(tot_prev_cart * a_decimal(tasa_bcv_global)):,.2f})")
+
+            if submitted_prev:
+                estado_cli_actual = cli_row_preview["estado_cliente"]
                 if estado_cli_actual in ["Bloqueado", "Inactivo"]:
-                    st.error(f"Operación bloqueada: el cliente `{cli_row['codigo_cliente']}` se encuentra en estado `{estado_cli_actual}`.")
+                    st.error(f"Operación bloqueada: el cliente `{cli_row_preview['codigo_cliente']}` se encuentra en estado `{estado_cli_actual}`.")
                 elif cond_pago_prev.startswith("Crédito") and estado_cli_actual == "Moroso":
                     st.error("Crédito denegado: el cliente tiene estado `Moroso`. Seleccione Contado o regularice su cartera.")
                 else:
-                    precio_base = float(prod_row["precio_mayor_usd"]) if escala_prev == "Mayorista" else float(prod_row["precio_detal_usd"])
-                    if precio_base <= 0:
-                        precio_base = float(prod_row["costo_unitario_usd"]) * 1.25
+                    items_prev_final = list(st.session_state.carrito_preventa_items)
+                    if not items_prev_final:
+                        calc_p = calcular_lineas_preventa(cant_prev, precio_base_prev, desc_prev, imp_prev, tasa_bcv_global)
+                        items_prev_final = [{
+                            "sku": sku_p_preview,
+                            "producto_nombre": str(prod_row_preview["nombre"]),
+                            "cantidad": float(cant_prev),
+                            "precio_unitario_usd": float(precio_base_prev),
+                            "costo_unitario_usd": float(prod_row_preview["costo_unitario_usd"]),
+                            "descuento_pct": float(desc_prev),
+                            "impuesto_pct": float(imp_prev),
+                            "subtotal_usd": float(calc_p["subtotal_usd"]),
+                            "descuento_usd": float(calc_p["descuento_usd"]),
+                            "impuesto_usd": float(calc_p["impuesto_usd"]),
+                            "total_usd": float(calc_p["total_usd"]),
+                        }]
 
-                    calculos = calcular_lineas_preventa(cant_prev, precio_base, desc_prev, imp_prev, tasa_bcv_global)
-                    eval_margen = evaluar_margen_minimo(precio_base, float(prod_row["costo_unitario_usd"]), desc_prev, margen_min_pct=15.0)
-                    reservado_actual = obtener_stock_reservado_sku(sku_p)
-                    stock_disponible_real = float(prod_row["stock_actual"]) - reservado_actual
+                    # Validación de margen mínimo para rol VENDEDOR en cada línea
+                    if nivel_rbac == "VENDEDOR":
+                        for it_chk in items_prev_final:
+                            ev_m = evaluar_margen_minimo(it_chk["precio_unitario_usd"], it_chk["costo_unitario_usd"], it_chk["descuento_pct"], margen_min_pct=15.0)
+                            if not ev_m["cumple_margen"]:
+                                st.error(f"SKU `{it_chk['sku']}` con margen {ev_m['margen_pct']}% (< 15.0%). Requiere aprobación de Supervisor o Administrador.")
+                                st.stop()
 
-                    if float(cant_prev) > stock_disponible_real and estado_ini_prev != "Borrador":
-                        st.error(f"Stock disponible insuficiente para reservar ({stock_disponible_real:,.2f} disponibles; {reservado_actual:,.2f} ya reservados).")
-                    elif not eval_margen["cumple_margen"] and nivel_rbac == "VENDEDOR":
-                        st.error(f"Precio/descuento por debajo del margen mínimo (15.0%; margen calculado: {eval_margen['margen_pct']}%). Requiere aprobación de Supervisor o Administrador.")
-                    else:
-                        cod_prev = generar_codigo("PREV", "preventas")
-                        fecha_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-                        stock_res = float(cant_prev) if estado_ini_prev in ["Registrada / Preventa", "Aprobada"] else 0.0
-                        req_aprob = 0 if eval_margen["cumple_margen"] else 1
-                        aprob_por = user["username"] if estado_ini_prev == "Aprobada" else ""
-
-                        conn = get_connection()
-                        cur = conn.cursor()
-                        cur.execute(
-                            """
-                            INSERT INTO preventas
-                            (codigo_preventa, fecha, cliente_id, codigo_cliente, cliente_nombre, rif_cliente,
-                             vendedor, territorio, municipio, almacen_origen, moneda, tasa_bcv, condicion_pago,
-                             escala_precio, sku, producto_nombre, cantidad, precio_unitario_usd, descuento_pct,
-                             impuesto_pct, subtotal_usd, descuento_usd, impuesto_usd, total_usd, total_bs,
-                             stock_reservado, estado_preventa, requiere_aprobacion, aprobado_por,
-                             codigo_venta_vinculado, observaciones, creado_por, actualizado_en)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?)
-                            """,
-                            (
-                                cod_prev, fecha_str, int(cli_row["id"]), cli_row["codigo_cliente"],
-                                cli_row["nombre_comercio"], cli_row["rif_cedula"], vendedor_prev,
-                                cli_row["territorio"], cli_row["municipio"], almacen_orig, moneda_prev,
-                                float(tasa_bcv_global), cond_pago_prev, escala_prev, sku_p, prod_row["nombre"],
-                                float(cant_prev), precio_base, float(desc_prev), float(imp_prev),
-                                calculos["subtotal_usd"], calculos["descuento_usd"], calculos["impuesto_usd"],
-                                calculos["total_usd"], calculos["total_bs"], stock_res, estado_ini_prev,
-                                req_aprob, aprob_por, normalizar_texto_titulo(obs_prev), user["username"], fecha_str
-                            )
+                    try:
+                        res_prev = crear_preventa_multisku_atomica(
+                            cli_row=cli_row_preview.to_dict(),
+                            vendedor=vendedor_prev,
+                            almacen_origen=almacen_orig,
+                            moneda=moneda_prev,
+                            tasa_bcv=tasa_bcv_global,
+                            condicion_pago=cond_pago_prev,
+                            escala_precio=escala_prev,
+                            estado_inicial=estado_ini_prev,
+                            items=items_prev_final,
+                            observaciones=obs_prev,
+                            user_ctx=user
                         )
-                        cur.execute(
-                            """
-                            INSERT INTO historial_preventas
-                            (codigo_preventa, estado_anterior, estado_nuevo, usuario, rol, motivo, fecha)
-                            VALUES (?, ?, ?, ?, ?, ?, ?)
-                            """,
-                            (cod_prev, "N/A", estado_ini_prev, user["username"], nivel_rbac, "Creación inicial de preventa", fecha_str)
-                        )
-                        conn.commit()
-                        conn.close()
 
-                        registrar_auditoria_comercial(user, "Preventas", "CREAR_PREVENTA", cod_prev, f"Total ${calculos['total_usd']:,.2f} | Estado: {estado_ini_prev}")
-
+                        filas_pdf_p = [
+                            [l["sku"], l["producto_nombre"][:34], f"{l['cantidad']:,.2f}", f"${l['precio_unitario_usd']:,.2f}", f"${l['total_usd']:,.2f}"]
+                            for l in res_prev["lineas"]
+                        ]
                         pdf_prev = generar_pdf_comprobante(
-                            titulo_documento="Cotización / Orden de Preventa Comercial",
-                            codigo_documento=cod_prev,
+                            titulo_documento="Cotización / Prepedido Multi-SKU Comercial",
+                            codigo_documento=res_prev["codigo_preventa"],
                             unidad_emisora="Unidad de Despacho, Comercialización y Ventas",
                             datos_generales={
-                                "Cliente": f"{cli_row['codigo_cliente']} - {cli_row['nombre_comercio']}",
-                                "RIF": cli_row["rif_cedula"],
+                                "Cliente": f"{cli_row_preview['codigo_cliente']} - {cli_row_preview['nombre_comercio']}",
+                                "RIF": cli_row_preview["rif_cedula"],
                                 "Vendedor": vendedor_prev,
-                                "Territorio / Almacén": f"{cli_row['territorio']} | {almacen_orig}",
+                                "Territorio / Almacén": f"{cli_row_preview['territorio']} | {almacen_orig}",
                                 "Condición Pago": cond_pago_prev,
-                                "Estado Preventa": estado_ini_prev
+                                "Estado Prepedido": estado_ini_prev
                             },
                             columnas_tabla=["SKU", "Producto", "Cant.", "P. Unit ($)", "Total ($)"],
-                            filas_tabla=[[sku_p, prod_row["nombre"], f"{cant_prev:,.2f}", f"${precio_base:,.2f}", f"${calculos['total_usd']:,.2f}"]],
+                            filas_tabla=filas_pdf_p,
                             totales={
-                                "SUBTOTAL BRUTO:": f"${calculos['subtotal_usd']:,.2f}",
-                                "DESCUENTO / IMP.:": f"-${calculos['descuento_usd']:,.2f} / +${calculos['impuesto_usd']:,.2f}",
-                                "TOTAL PREVENTA ($):": f"${calculos['total_usd']:,.2f}",
-                                "EQUIVALENTE (Bs):": f"Bs {calculos['total_bs']:,.2f}"
+                                "SUBTOTAL BRUTO:": f"${res_prev['subtotal_usd']:,.2f}",
+                                "DESCUENTO / IMP.:": f"-${res_prev['descuento_usd']:,.2f} / +${res_prev['impuesto_usd']:,.2f}",
+                                "TOTAL PREPEDIDO ($):": f"${res_prev['total_usd']:,.2f}",
+                                "EQUIVALENTE (Bs):": f"Bs {res_prev['total_bs']:,.2f}"
                             },
-                            observaciones=obs_prev or f"Tasa BCV aplicada: Bs {tasa_bcv_global:,.2f}/$. Margen línea: {eval_margen['margen_pct']}%.",
+                            observaciones=obs_prev or f"Prepedido con {len(res_prev['lineas'])} SKU(s) | Tasa BCV: Bs {tasa_bcv_global:,.2f}/$.",
                             firmas=("Vendedor / Promotor", "Supervisor Comercial", "Cliente / Conforme")
                         )
                         st.session_state.ultimo_pdf_preventa = pdf_prev
-                        st.session_state.ultimo_cod_preventa = cod_prev
-                        st.success(f"Preventa `{cod_prev}` registrada por ${calculos['total_usd']:,.2f} (Bs {calculos['total_bs']:,.2f}).")
+                        st.session_state.ultimo_cod_preventa = res_prev["codigo_preventa"]
+                        st.session_state.carrito_preventa_items = []
+                        st.success(f"Prepedido `{res_prev['codigo_preventa']}` registrado con {len(res_prev['lineas'])} SKU(s) por ${res_prev['total_usd']:,.2f} (Bs {res_prev['total_bs']:,.2f}).")
                         st.rerun()
-
-        if st.session_state.ultimo_pdf_preventa is not None:
-            st.download_button(
-                label="Descargar Cotización / Preventa (PDF)",
-                data=st.session_state.ultimo_pdf_preventa,
-                file_name=f"{st.session_state.ultimo_cod_preventa}.pdf",
-                mime="application/pdf",
-                key="btn_descargar_preventa_pdf"
-            )
+                    except Exception as e:
+                        st.error(str(e))
 
         st.markdown("#### Flujo de Estados y Conversión de Preventas a Venta/Despacho")
         st.dataframe(df_preventas, use_container_width=True, hide_index=True)
+
+        df_prev_items_all = query_df("SELECT * FROM preventa_items ORDER BY id DESC")
+        if not df_prev_items_all.empty:
+            st.markdown("##### Detalle por SKU de Prepedidos (`preventa_items`)")
+            st.dataframe(df_prev_items_all, use_container_width=True, hide_index=True)
 
         if not df_preventas.empty:
             with st.form("form_transicion_preventa"):
@@ -3282,25 +4294,80 @@ elif modulo_activo == "4. Despacho, Comercialización y Ventas":
                             st.error(f"No hay stock físico suficiente en inventario ({stock_act_sku:,.2f}) para despachar `{cod_p_sel}`.")
                             st.stop()
 
+                        cur.execute("SELECT * FROM preventa_items WHERE codigo_preventa = ?", (cod_p_sel,))
+                        p_items_rows = cur.fetchall()
+                        lineas_despacho = []
+                        if p_items_rows:
+                            for pir in p_items_rows:
+                                lineas_despacho.append({
+                                    "sku": pir["sku"],
+                                    "cantidad": float(pir["cantidad"]),
+                                    "precio_unitario_usd": float(pir["precio_unitario_usd"]),
+                                    "total_usd": float(pir["total_usd"])
+                                })
+                        else:
+                            lineas_despacho.append({
+                                "sku": p_row["sku"],
+                                "cantidad": float(p_row["cantidad"]),
+                                "precio_unitario_usd": float(p_row["precio_unitario_usd"]),
+                                "total_usd": float(p_row["total_usd"])
+                            })
+
+                        for ld in lineas_despacho:
+                            cur.execute("SELECT stock_actual FROM inventario WHERE sku = ?", (ld["sku"],))
+                            inv_r = cur.fetchone()
+                            stock_act_sku = float(inv_r["stock_actual"]) if inv_r else 0.0
+                            if stock_act_sku < float(ld["cantidad"]):
+                                conn.rollback()
+                                conn.close()
+                                st.error(f"Stock físico insuficiente para SKU `{ld['sku']}` ({stock_act_sku:,.2f} disp. vs {ld['cantidad']:,.2f} requeridas) en `{cod_p_sel}`.")
+                                st.stop()
+
                         cod_vta_gen = generar_codigo("VTA", "ventas")
                         est_cob = "Cobrado" if p_row["condicion_pago"] == "Contado" else "Pendiente de Cobro"
-                        cur.execute(
-                            """
-                            INSERT INTO ventas
-                            (codigo_venta, fecha, cliente_comercio, rif_cedula, territorio, municipio, promotor,
-                             escala_precio, sku, cantidad, precio_unitario_usd, total_usd, tasa_bcv, total_bs,
-                             condicion_pago, estado_despacho, estado_cobro, responsable)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            """,
-                            (
-                                cod_vta_gen, fecha_now, p_row["cliente_nombre"], p_row["rif_cliente"],
-                                p_row["territorio"], p_row["municipio"], p_row["vendedor"], p_row["escala_precio"],
-                                p_row["sku"], float(p_row["cantidad"]), float(p_row["precio_unitario_usd"]),
-                                float(p_row["total_usd"]), float(tasa_bcv_global), float(p_row["total_usd"]) * float(tasa_bcv_global),
-                                p_row["condicion_pago"], "Despachado", est_cob, user["username"]
+
+                        if len(lineas_despacho) == 1:
+                            ld0 = lineas_despacho[0]
+                            cur.execute(
+                                """
+                                INSERT INTO ventas
+                                (codigo_venta, fecha, cliente_comercio, rif_cedula, territorio, municipio, promotor,
+                                 escala_precio, sku, cantidad, precio_unitario_usd, total_usd, tasa_bcv, total_bs,
+                                 condicion_pago, estado_despacho, estado_cobro, responsable)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                """,
+                                (
+                                    cod_vta_gen, fecha_now, p_row["cliente_nombre"], p_row["rif_cliente"],
+                                    p_row["territorio"], p_row["municipio"], p_row["vendedor"], p_row["escala_precio"],
+                                    ld0["sku"], float(ld0["cantidad"]), float(ld0["precio_unitario_usd"]),
+                                    float(ld0["total_usd"]), float(tasa_bcv_global), float(ld0["total_usd"]) * float(tasa_bcv_global),
+                                    p_row["condicion_pago"], "Despachado", est_cob, user["username"]
+                                )
                             )
-                        )
-                        cur.execute("UPDATE inventario SET stock_actual = stock_actual - ? WHERE sku = ?", (float(p_row["cantidad"]), p_row["sku"]))
+                        else:
+                            cant_sum_d = sum(float(x["cantidad"]) for x in lineas_despacho)
+                            tot_sum_d = float(p_row["total_usd"])
+                            p_prom_d = (tot_sum_d / cant_sum_d) if cant_sum_d > 0 else 0.0
+                            cur.execute(
+                                """
+                                INSERT INTO ventas
+                                (codigo_venta, fecha, cliente_comercio, rif_cedula, territorio, municipio, promotor,
+                                 escala_precio, sku, cantidad, precio_unitario_usd, total_usd, tasa_bcv, total_bs,
+                                 condicion_pago, estado_despacho, estado_cobro, responsable)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                """,
+                                (
+                                    cod_vta_gen, fecha_now, p_row["cliente_nombre"], p_row["rif_cliente"],
+                                    p_row["territorio"], p_row["municipio"], p_row["vendedor"], p_row["escala_precio"],
+                                    "MULTI-SKU", float(cant_sum_d), float(p_prom_d),
+                                    tot_sum_d, float(tasa_bcv_global), tot_sum_d * float(tasa_bcv_global),
+                                    p_row["condicion_pago"], "Despachado", est_cob, user["username"]
+                                )
+                            )
+
+                        for ld in lineas_despacho:
+                            cur.execute("UPDATE inventario SET stock_actual = stock_actual - ? WHERE sku = ?", (float(ld["cantidad"]), ld["sku"]))
+
                         if est_cob == "Pendiente de Cobro":
                             cur.execute(
                                 "UPDATE clientes_cartera SET saldo_pendiente_usd = saldo_pendiente_usd + ?, fecha_ultima_compra = ? WHERE codigo_cliente = ?",
@@ -3677,6 +4744,11 @@ elif modulo_activo == "4. Despacho, Comercialización y Ventas":
             df_ventas.to_excel(writer, sheet_name="Ventas", index=False)
             df_bitacora.to_excel(writer, sheet_name="Bitacora_Cartera", index=False)
             df_audit.to_excel(writer, sheet_name="Auditoria_RBAC", index=False)
+            query_df("SELECT * FROM preventa_items ORDER BY id DESC").to_excel(writer, sheet_name="Prepedido_Items", index=False)
+            query_df("SELECT * FROM factura_items ORDER BY id DESC").to_excel(writer, sheet_name="Factura_Items", index=False)
+            query_df("SELECT * FROM suministros_materiales ORDER BY id DESC").to_excel(writer, sheet_name="Suministros", index=False)
+            query_df("SELECT * FROM afectacion_cuentas_presupuesto ORDER BY id DESC").to_excel(writer, sheet_name="Afectacion_Presupuesto", index=False)
+            query_df("SELECT * FROM pasarela_pago_movil ORDER BY id DESC").to_excel(writer, sheet_name="Pasarela_Pago_Movil", index=False)
         exp2.download_button(
             label="Exportar Paquete Comercial Completo (.XLSX)",
             data=buf_com.getvalue(),
